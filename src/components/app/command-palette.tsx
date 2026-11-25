@@ -9,6 +9,7 @@ import {
   DatabaseIcon,
   HomeIcon,
   KeyboardIcon,
+  ListIcon,
   SettingsIcon,
   LayoutGridIcon,
   MonitorIcon,
@@ -21,6 +22,7 @@ import {
   SquareTerminalIcon,
   SunIcon,
   UploadIcon,
+  UsersIcon,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { Fragment, useMemo, useState } from 'react'
@@ -237,6 +239,20 @@ export function CommandPalette({
         icon: NetworkIcon,
         keywords: 'er erd relations schema graph',
         run: () => void navigate({ to: '/c/$connId/$db/diagram', params: { connId: connectionId, db: database } }),
+      },
+      {
+        id: 'databases',
+        label: 'Manage databases',
+        icon: ListIcon,
+        keywords: 'create rename owner limit drop delete database list',
+        run: () => void navigate({ to: '/c/$connId/$db/databases', params: { connId: connectionId, db: database } }),
+      },
+      {
+        id: 'roles',
+        label: 'Manage roles',
+        icon: UsersIcon,
+        keywords: 'create user group login password permission grant privilege member role list',
+        run: () => void navigate({ to: '/c/$connId/$db/roles', params: { connId: connectionId, db: database } }),
       },
       {
         id: 'refresh',

@@ -207,5 +207,95 @@ export function explorerValidators() {
       executionId: s.string(),
     }),
     cancelSql: s.object({ executionId: s.string() }),
+    // The wanted state of a database (the server builds the SQL from it). Limits: PostgreSQL's own.
+    alterDatabase: target.extend({
+      desired: s.object({
+        name: s.string().trim().max(200),
+        owner: s.string().trim().min(1, 'Owner is required.').max(200),
+        comment: s.string().max(10_000).nullable(),
+        connectionLimit: s.union([s.null(), s.number().int().min(-1).max(2_147_483_647)]),
+        allowConnections: s.boolean(),
+        settings: s.array(s.object({ name: s.string().max(200), value: s.string().max(10_000) })).max(500),
+      }),
+    }),
+    dropDatabase: target.extend({ force: s.boolean() }),
+    createDatabase: s.object({ connectionId: s.string(), draft: createDatabaseDraftSchema() }),
+    // Roles: the wanted state (the server builds the SQL). A password is sent only to be hashed.
+    createRole: s.object({ connectionId: s.string(), draft: roleDraftSchema() }),
+    alterRole: s.object({ connectionId: s.string(), name: s.string().max(200), draft: roleDraftSchema() }),
+    dropRole: s.object({
+      connectionId: s.string(),
+      name: s.string().max(200),
+      reassignTo: s.string().max(200).nullable(),
+      dropOwned: s.boolean(),
+    }),
+    // A role's privileges: the wanted state per database and schema (the server builds the SQL).
+    rolePrivileges: target.extend({ role: s.string().max(200) }),
+    applyRolePrivileges: target.extend({
+      role: s.string().max(200),
+      draft: s.object({
+        databases: s
+          .array(
+            s.object({
+              name: s.string().max(200),
+              connect: s.boolean(),
+              create: s.boolean(),
+              temporary: s.boolean(),
+            }),
+          )
+          .max(500),
+        schemas: s.array(s.object({ name: s.string().max(200), level: s.enum(['none', 'read', 'write']) })).max(1000),
+      }),
+    }),
   }
+}
+
+/** The Roles draft. The server checks names, numbers, dates and passwords again. */
+function roleDraftSchema() {
+  return s.object({
+    name: s.string().trim().max(200),
+    canLogin: s.boolean(),
+    password: s.string().max(1000).nullable(),
+    superuser: s.boolean(),
+    createDb: s.boolean(),
+    createRole: s.boolean(),
+    inherit: s.boolean(),
+    replication: s.boolean(),
+    bypassRls: s.boolean(),
+    connectionLimit: s.number().int().min(-2_147_483_648).max(2_147_483_647).nullable(),
+    validUntil: s.string().max(64).nullable(),
+    memberOf: s.array(s.string().max(200)).max(500),
+    comment: s.string().max(10_000).nullable(),
+    settings: s.array(s.object({ name: s.string().max(200), value: s.string().max(10_000) })).max(500),
+  })
+}
+
+/** The New database draft. The server checks names, numbers and the options per version again. */
+function createDatabaseDraftSchema() {
+  const text = (max: number) => s.string().max(max).nullable()
+  const locale = text(1000)
+  return s.object({
+    name: s.string().max(200),
+    owner: text(200),
+    template: text(200),
+    encoding: text(200),
+    localeProvider: s.enum(['libc', 'icu', 'builtin']).nullable(),
+    locale,
+    lcCollate: locale,
+    lcCtype: locale,
+    icuLocale: locale,
+    icuRules: locale,
+    builtinLocale: locale,
+    collationVersion: locale,
+    tablespace: text(200),
+    strategy: s.enum(['wal_log', 'file_copy']).nullable(),
+    allowConnections: s.boolean(),
+    connectionLimit: s.number().int().min(-2_147_483_648).max(2_147_483_647).nullable(),
+    isTemplate: s.boolean(),
+    oid: s.number().int().min(-2_147_483_648).max(4_294_967_295).nullable(),
+    comment: s.string().max(10_000).nullable(),
+    settings: s
+      .array(s.object({ name: s.string().max(200), value: s.string().max(10_000) }))
+      .max(100, 'Too many settings (max 100).'),
+  })
 }

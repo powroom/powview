@@ -1,7 +1,7 @@
 import { DIAGRAM_TABLE_LIMIT } from '@/lib/diagram'
 import type { DiagramColumn, DiagramForeignKey, DiagramTable, SchemaDiagram } from '@/lib/diagram'
 import type { RelationKind } from '@/lib/types'
-import { numOrNull } from './introspect.server'
+import { NOT_EXTENSION_MEMBER, numOrNull } from './introspect.server'
 import { query } from './pool.server'
 
 /**
@@ -29,6 +29,8 @@ export async function schemaDiagram(connectionId: string, database: string, sche
         WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
           AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
           AND NOT c.relispartition
+          -- objects of an extension (such as the pg_stat_statements views) are left out, as in the sidebar
+          AND ${NOT_EXTENSION_MEMBER('c.oid', 'pg_class')}
         ORDER BY c.relname
         LIMIT ${DIAGRAM_TABLE_LIMIT + 1}
      )

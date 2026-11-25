@@ -23,7 +23,9 @@ import { Route as CConnIdIndexRouteImport } from './routes/c.$connId.index'
 import { Route as CConnIdDbRouteImport } from './routes/c.$connId.$db'
 import { Route as ApiExportDatabaseStatusRouteImport } from './routes/api/export/database/status'
 import { Route as CConnIdDbIndexRouteImport } from './routes/c.$connId.$db.index'
+import { Route as CConnIdDbDatabasesRouteImport } from './routes/c.$connId.$db.databases'
 import { Route as CConnIdDbDiagramRouteImport } from './routes/c.$connId.$db.diagram'
+import { Route as CConnIdDbRolesRouteImport } from './routes/c.$connId.$db.roles'
 import { Route as CConnIdDbSqlRouteImport } from './routes/c.$connId.$db.sql'
 import { Route as CConnIdDbTSchemaTableRouteImport } from './routes/c.$connId.$db.t.$schema.$table'
 
@@ -97,9 +99,19 @@ const CConnIdDbIndexRoute = CConnIdDbIndexRouteImport.update({
   path: '/',
   getParentRoute: () => CConnIdDbRoute,
 } as any)
+const CConnIdDbDatabasesRoute = CConnIdDbDatabasesRouteImport.update({
+  id: '/databases',
+  path: '/databases',
+  getParentRoute: () => CConnIdDbRoute,
+} as any)
 const CConnIdDbDiagramRoute = CConnIdDbDiagramRouteImport.update({
   id: '/diagram',
   path: '/diagram',
+  getParentRoute: () => CConnIdDbRoute,
+} as any)
+const CConnIdDbRolesRoute = CConnIdDbRolesRouteImport.update({
+  id: '/roles',
+  path: '/roles',
   getParentRoute: () => CConnIdDbRoute,
 } as any)
 const CConnIdDbSqlRoute = CConnIdDbSqlRouteImport.update({
@@ -127,7 +139,9 @@ export interface FileRoutesByFullPath {
   '/c/$connId/$db': typeof CConnIdDbRouteWithChildren
   '/c/$connId/': typeof CConnIdIndexRoute
   '/api/export/database/status': typeof ApiExportDatabaseStatusRoute
+  '/c/$connId/$db/databases': typeof CConnIdDbDatabasesRoute
   '/c/$connId/$db/diagram': typeof CConnIdDbDiagramRoute
+  '/c/$connId/$db/roles': typeof CConnIdDbRolesRoute
   '/c/$connId/$db/sql': typeof CConnIdDbSqlRoute
   '/c/$connId/$db/': typeof CConnIdDbIndexRoute
   '/c/$connId/$db/t/$schema/$table': typeof CConnIdDbTSchemaTableRoute
@@ -145,7 +159,9 @@ export interface FileRoutesByTo {
   '/api/v1/$': typeof ApiV1SplatRoute
   '/c/$connId': typeof CConnIdIndexRoute
   '/api/export/database/status': typeof ApiExportDatabaseStatusRoute
+  '/c/$connId/$db/databases': typeof CConnIdDbDatabasesRoute
   '/c/$connId/$db/diagram': typeof CConnIdDbDiagramRoute
+  '/c/$connId/$db/roles': typeof CConnIdDbRolesRoute
   '/c/$connId/$db/sql': typeof CConnIdDbSqlRoute
   '/c/$connId/$db': typeof CConnIdDbIndexRoute
   '/c/$connId/$db/t/$schema/$table': typeof CConnIdDbTSchemaTableRoute
@@ -165,7 +181,9 @@ export interface FileRoutesById {
   '/c/$connId/$db': typeof CConnIdDbRouteWithChildren
   '/c/$connId/': typeof CConnIdIndexRoute
   '/api/export/database/status': typeof ApiExportDatabaseStatusRoute
+  '/c/$connId/$db/databases': typeof CConnIdDbDatabasesRoute
   '/c/$connId/$db/diagram': typeof CConnIdDbDiagramRoute
+  '/c/$connId/$db/roles': typeof CConnIdDbRolesRoute
   '/c/$connId/$db/sql': typeof CConnIdDbSqlRoute
   '/c/$connId/$db/': typeof CConnIdDbIndexRoute
   '/c/$connId/$db/t/$schema/$table': typeof CConnIdDbTSchemaTableRoute
@@ -186,7 +204,9 @@ export interface FileRouteTypes {
     | '/c/$connId/$db'
     | '/c/$connId/'
     | '/api/export/database/status'
+    | '/c/$connId/$db/databases'
     | '/c/$connId/$db/diagram'
+    | '/c/$connId/$db/roles'
     | '/c/$connId/$db/sql'
     | '/c/$connId/$db/'
     | '/c/$connId/$db/t/$schema/$table'
@@ -204,7 +224,9 @@ export interface FileRouteTypes {
     | '/api/v1/$'
     | '/c/$connId'
     | '/api/export/database/status'
+    | '/c/$connId/$db/databases'
     | '/c/$connId/$db/diagram'
+    | '/c/$connId/$db/roles'
     | '/c/$connId/$db/sql'
     | '/c/$connId/$db'
     | '/c/$connId/$db/t/$schema/$table'
@@ -223,7 +245,9 @@ export interface FileRouteTypes {
     | '/c/$connId/$db'
     | '/c/$connId/'
     | '/api/export/database/status'
+    | '/c/$connId/$db/databases'
     | '/c/$connId/$db/diagram'
+    | '/c/$connId/$db/roles'
     | '/c/$connId/$db/sql'
     | '/c/$connId/$db/'
     | '/c/$connId/$db/t/$schema/$table'
@@ -344,11 +368,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof CConnIdDbIndexRouteImport
       parentRoute: typeof CConnIdDbRoute
     }
+    '/c/$connId/$db/databases': {
+      id: '/c/$connId/$db/databases'
+      path: '/databases'
+      fullPath: '/c/$connId/$db/databases'
+      preLoaderRoute: typeof CConnIdDbDatabasesRouteImport
+      parentRoute: typeof CConnIdDbRoute
+    }
     '/c/$connId/$db/diagram': {
       id: '/c/$connId/$db/diagram'
       path: '/diagram'
       fullPath: '/c/$connId/$db/diagram'
       preLoaderRoute: typeof CConnIdDbDiagramRouteImport
+      parentRoute: typeof CConnIdDbRoute
+    }
+    '/c/$connId/$db/roles': {
+      id: '/c/$connId/$db/roles'
+      path: '/roles'
+      fullPath: '/c/$connId/$db/roles'
+      preLoaderRoute: typeof CConnIdDbRolesRouteImport
       parentRoute: typeof CConnIdDbRoute
     }
     '/c/$connId/$db/sql': {
@@ -380,14 +418,18 @@ const ApiExportDatabaseRouteWithChildren =
   ApiExportDatabaseRoute._addFileChildren(ApiExportDatabaseRouteChildren)
 
 interface CConnIdDbRouteChildren {
+  CConnIdDbDatabasesRoute: typeof CConnIdDbDatabasesRoute
   CConnIdDbDiagramRoute: typeof CConnIdDbDiagramRoute
+  CConnIdDbRolesRoute: typeof CConnIdDbRolesRoute
   CConnIdDbSqlRoute: typeof CConnIdDbSqlRoute
   CConnIdDbIndexRoute: typeof CConnIdDbIndexRoute
   CConnIdDbTSchemaTableRoute: typeof CConnIdDbTSchemaTableRoute
 }
 
 const CConnIdDbRouteChildren: CConnIdDbRouteChildren = {
+  CConnIdDbDatabasesRoute: CConnIdDbDatabasesRoute,
   CConnIdDbDiagramRoute: CConnIdDbDiagramRoute,
+  CConnIdDbRolesRoute: CConnIdDbRolesRoute,
   CConnIdDbSqlRoute: CConnIdDbSqlRoute,
   CConnIdDbIndexRoute: CConnIdDbIndexRoute,
   CConnIdDbTSchemaTableRoute: CConnIdDbTSchemaTableRoute,

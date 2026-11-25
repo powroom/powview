@@ -2,7 +2,17 @@
  * SQL for changing a table's structure from forms (create table, columns, indexes,
  * constraints). Every statement is shown to the user before it runs.
  */
-import { qualifiedName, quoteIdent } from './sql'
+import { qualifiedName, quoteIdent, quoteLiteral } from './sql'
+import type {
+  DatabaseCreateDraft,
+  DatabaseInfo,
+  DatabaseSetting,
+  RoleDraft,
+  RoleInfo,
+  RolePrivileges,
+  RolePrivilegesDraft,
+  SchemaAccessLevel,
+} from './types'
 
 export interface ColumnDraft {
   name: string
@@ -80,7 +90,7 @@ function columnDefinition(c: ColumnDraft, enumTypes?: ReadonlySet<string>, inlin
 
 function commentSql(target: string, comment: string): string {
   const c = comment.trim()
-  return `COMMENT ON ${target} IS ${c ? `'${c.replace(/'/g, "''")}'` : 'NULL'}`
+  return `COMMENT ON ${target} IS ${c ? quoteLiteral(c) : 'NULL'}`
 }
 
 export function createTableSql(
@@ -245,9 +255,209 @@ export function createSchemaSql(name: string, comment = ''): string[] {
   return out
 }
 
-/** CREATE DATABASE with the server defaults (owner, encoding, template). One statement, so it runs outside a transaction. */
-export function createDatabaseSql(name: string): string[] {
-  return [`CREATE DATABASE ${quoteIdent(name.trim())}`]
+/** Server character sets that CREATE DATABASE accepts (PostgreSQL docs, "Server Character Sets"). */
+export const DATABASE_ENCODINGS = [
+  'UTF8',
+  'SQL_ASCII',
+  ...Array.from({ length: 10 }, (_, i) => `LATIN${i + 1}`),
+  ...Array.from({ length: 9 }, (_, i) => `WIN125${i}`),
+  'EUC_JP',
+  'EUC_KR',
+  'EUC_CN',
+  'EUC_TW',
+  'EUC_JIS_2004',
+  'ISO_8859_5',
+  'ISO_8859_6',
+  'ISO_8859_7',
+  'ISO_8859_8',
+  'KOI8R',
+  'KOI8U',
+  'MULE_INTERNAL',
+  'WIN866',
+  'WIN874',
+]
+
+const MAX_OID = 4294967295
+
+/** Trimmed text, or null when blank. */
+function text(value: string | null): string | null {
+  return value?.trim() || null
+}
+
+/**
+ * The draft with every option that this server version, or this template, cannot take set to
+ * null. Encoding and locale options need template0. Each version gate is written once, here.
+ */
+function applicableDraft(d: DatabaseCreateDraft, versionNum: number): DatabaseCreateDraft {
+  const template = text(d.template)
+  const clean = template === 'template0'
+  const modern = versionNum >= 150000
+  const provider = clean && modern && (d.localeProvider !== 'builtin' || versionNum >= 170000) ? d.localeProvider : null
+  const libc = clean && (provider === null || provider === 'libc')
+  return {
+    ...d,
+    owner: text(d.owner),
+    template,
+    encoding: clean ? text(d.encoding) : null,
+    localeProvider: provider,
+    locale: libc ? text(d.locale) : null,
+    lcCollate: libc ? text(d.lcCollate) : null,
+    lcCtype: libc ? text(d.lcCtype) : null,
+    icuLocale: provider === 'icu' ? text(d.icuLocale) : null,
+    icuRules: provider === 'icu' && versionNum >= 160000 ? text(d.icuRules) : null,
+    builtinLocale: provider === 'builtin' ? text(d.builtinLocale) : null,
+    collationVersion: clean && modern ? text(d.collationVersion) : null,
+    tablespace: text(d.tablespace),
+    strategy: modern ? d.strategy : null,
+    oid: modern ? d.oid : null,
+    comment: text(d.comment),
+  }
+}
+
+/** The first problem with a new database draft, or null. `taken` lists the existing names. */
+function draftProblem(draft: DatabaseCreateDraft, versionNum: number, taken?: readonly string[]): string | null {
+  const name = nameProblem(draft.name, taken)
+  if (name) return name
+  for (const setting of draft.settings) {
+    const problem = settingNameProblem(setting.name)
+    if (problem) return `Setting "${setting.name.trim()}": ${problem}`
+  }
+  const limit = draft.connectionLimit
+  if (limit !== null && (!Number.isInteger(limit) || limit < 0)) {
+    return 'Connection limit must be a whole number, 0 or more. Leave it empty for no limit.'
+  }
+  const oid = draft.oid
+  if (oid !== null && (!Number.isInteger(oid) || oid < 1 || oid > MAX_OID)) {
+    return `OID must be a whole number from 1 to ${MAX_OID}.`
+  }
+  const applied = applicableDraft(draft, versionNum)
+  if (applied.localeProvider === 'icu' && !applied.icuLocale) return 'The ICU provider needs an ICU locale.'
+  if (applied.localeProvider === 'builtin' && !applied.builtinLocale) {
+    return 'The builtin provider needs a builtin locale.'
+  }
+  if (applied.builtinLocale === 'PG_UNICODE_FAST' && versionNum < 180000) {
+    return 'PG_UNICODE_FAST needs PostgreSQL 18 or newer.'
+  }
+  return null
+}
+
+/**
+ * The first problem with a new database draft, in plain English, for the dialog. `takenNames`
+ * are the databases that already exist. Agrees with createDatabaseSql.
+ */
+export function createDatabaseProblem(
+  draft: DatabaseCreateDraft,
+  options: { versionNum: number; takenNames: string[] },
+): string | null {
+  return draftProblem(draft, options.versionNum, options.takenNames)
+}
+
+/**
+ * CREATE DATABASE with its WITH options, then COMMENT ON DATABASE and one ALTER DATABASE ... SET
+ * per setting. Options the version or template cannot take are left out. Throws on a problem
+ * that createDatabaseProblem reports (the name is not checked against existing names here).
+ * CREATE DATABASE cannot run in a transaction, so each statement runs on its own.
+ */
+export function createDatabaseSql(draft: DatabaseCreateDraft, versionNum: number): string[] {
+  const problem = draftProblem(draft, versionNum)
+  if (problem) throw new Error(`CREATE DATABASE: ${problem}`)
+  const d = applicableDraft(draft, versionNum)
+  const target = quoteIdent(draft.name.trim())
+  const clauses: string[] = []
+  if (d.owner) clauses.push(`OWNER = ${quoteIdent(d.owner)}`)
+  if (d.template) clauses.push(`TEMPLATE = ${quoteIdent(d.template)}`)
+  if (d.encoding) clauses.push(`ENCODING = ${quoteLiteral(d.encoding)}`)
+  if (d.strategy) clauses.push(`STRATEGY = ${d.strategy}`)
+  if (d.locale) clauses.push(`LOCALE = ${quoteLiteral(d.locale)}`)
+  if (d.lcCollate) clauses.push(`LC_COLLATE = ${quoteLiteral(d.lcCollate)}`)
+  if (d.lcCtype) clauses.push(`LC_CTYPE = ${quoteLiteral(d.lcCtype)}`)
+  if (d.icuLocale) clauses.push(`ICU_LOCALE = ${quoteLiteral(d.icuLocale)}`)
+  if (d.icuRules) clauses.push(`ICU_RULES = ${quoteLiteral(d.icuRules)}`)
+  if (d.builtinLocale) clauses.push(`BUILTIN_LOCALE = ${quoteLiteral(d.builtinLocale)}`)
+  if (d.localeProvider) clauses.push(`LOCALE_PROVIDER = ${d.localeProvider}`)
+  if (d.collationVersion) clauses.push(`COLLATION_VERSION = ${quoteLiteral(d.collationVersion)}`)
+  if (d.tablespace) clauses.push(`TABLESPACE = ${quoteIdent(d.tablespace)}`)
+  if (!d.allowConnections) clauses.push('ALLOW_CONNECTIONS = false')
+  if (d.connectionLimit !== null) clauses.push(`CONNECTION LIMIT = ${d.connectionLimit}`)
+  if (d.isTemplate) clauses.push('IS_TEMPLATE = true')
+  if (d.oid !== null) clauses.push(`OID = ${d.oid}`)
+
+  const out = [`CREATE DATABASE ${target}${clauses.length ? ` WITH ${clauses.join(' ')}` : ''}`]
+  if (d.comment) out.push(commentSql(`DATABASE ${target}`, d.comment))
+  for (const setting of d.settings) {
+    out.push(`ALTER DATABASE ${target} SET ${setting.name.trim()} = ${quoteLiteral(setting.value)}`)
+  }
+  return out
+}
+
+/** The database fields that ALTER DATABASE can change. DatabaseInfo has all of them. */
+export type DatabaseFields = Pick<
+  DatabaseInfo,
+  'name' | 'owner' | 'comment' | 'connectionLimit' | 'allowConnections' | 'settings'
+>
+
+/** The wanted state of a database. `settings` left out means "do not touch the settings". */
+export type DatabaseDraft = Omit<DatabaseFields, 'settings'> & { settings?: DatabaseSetting[] }
+
+const SETTING_NAME = /^[A-Za-z_][A-Za-z0-9_.]*$/
+
+/** Why a database setting name cannot be used, or null. */
+export function settingNameProblem(name: string): string | null {
+  const n = name.trim()
+  if (!n) return 'Required'
+  if (!SETTING_NAME.test(n)) return 'Use letters, digits, underscores and dots, starting with a letter or underscore'
+  return null
+}
+
+/**
+ * SET for new or changed settings, RESET for removed ones. `head` is the statement start, such as
+ * `ALTER DATABASE "shop"` or `ALTER ROLE "app"`. Throws on an invalid name.
+ */
+function settingsSql(head: string, before: DatabaseSetting[], after: DatabaseSetting[]): string[] {
+  const was = new Map(before.map((s) => [s.name, s.value]))
+  const now = new Map<string, string>()
+  for (const s of after) {
+    const name = s.name.trim()
+    const problem = settingNameProblem(name)
+    if (problem) throw new Error(`Setting "${name}": ${problem}`)
+    now.set(name, s.value)
+  }
+  const out: string[] = []
+  for (const [name, value] of now) {
+    if (was.get(name) !== value) out.push(`${head} SET ${name} = ${quoteLiteral(value)}`)
+  }
+  for (const name of was.keys()) {
+    if (!now.has(name)) out.push(`${head} RESET ${name}`)
+  }
+  return out
+}
+
+/**
+ * The ALTER DATABASE statements that take `before` to `after`, only for what changed. Every
+ * statement uses the current name; RENAME comes last, so the statements before it still work.
+ * Throws when a setting name is invalid (check it with settingNameProblem first).
+ */
+export function alterDatabaseSql(before: DatabaseFields, after: DatabaseDraft): string[] {
+  const from = quoteIdent(before.name)
+  const out: string[] = []
+  if (after.owner !== before.owner) out.push(`ALTER DATABASE ${from} OWNER TO ${quoteIdent(after.owner)}`)
+  const limitBefore = before.connectionLimit ?? -1
+  const limitAfter = after.connectionLimit ?? -1
+  if (limitAfter !== limitBefore) out.push(`ALTER DATABASE ${from} CONNECTION LIMIT ${limitAfter}`)
+  if (after.allowConnections !== before.allowConnections) {
+    out.push(`ALTER DATABASE ${from} WITH ALLOW_CONNECTIONS ${after.allowConnections ? 'true' : 'false'}`)
+  }
+  const commentAfter = (after.comment ?? '').trim()
+  if (commentAfter !== (before.comment ?? '').trim()) out.push(commentSql(`DATABASE ${from}`, commentAfter))
+  if (after.settings) out.push(...settingsSql(`ALTER DATABASE ${from}`, before.settings, after.settings))
+  const next = after.name.trim()
+  if (next !== before.name) out.push(`ALTER DATABASE ${from} RENAME TO ${quoteIdent(next)}`)
+  return out
+}
+
+/** DROP DATABASE. `name` is the exact current name (not trimmed). WITH (FORCE) also ends the sessions connected to it. */
+export function dropDatabaseSql(name: string, force: boolean): string {
+  return `DROP DATABASE ${quoteIdent(name)}${force ? ' WITH (FORCE)' : ''}`
 }
 
 /** Why a schema name cannot be used, or null. PostgreSQL reserves names that start with pg_. */
@@ -279,4 +489,227 @@ export function describedColumnSql(c: {
   else if (c.defaultValue) line += ` DEFAULT ${c.defaultValue}`
   if (!c.nullable) line += ' NOT NULL'
   return line
+}
+
+// ---------------------------------------------------------------------------
+// Roles (users and groups)
+// ---------------------------------------------------------------------------
+
+/**
+ * The literal the UI passes as `passwordSql` to preview a role change, so the password never
+ * shows. The server masks the real verifier with this same text before it returns statements.
+ */
+export const PASSWORD_MASK = "'********'"
+
+const VALID_UNTIL = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}(?::?\d{2})?)?)?$/
+
+type RoleFlagKey = 'canLogin' | 'superuser' | 'createDb' | 'createRole' | 'inherit' | 'replication' | 'bypassRls'
+
+/** The keyword pair for each boolean attribute, and the value PostgreSQL uses when none is given. */
+const ROLE_FLAGS: { key: RoleFlagKey; on: string; off: string; default: boolean }[] = [
+  { key: 'canLogin', on: 'LOGIN', off: 'NOLOGIN', default: false },
+  { key: 'superuser', on: 'SUPERUSER', off: 'NOSUPERUSER', default: false },
+  { key: 'createDb', on: 'CREATEDB', off: 'NOCREATEDB', default: false },
+  { key: 'createRole', on: 'CREATEROLE', off: 'NOCREATEROLE', default: false },
+  { key: 'inherit', on: 'INHERIT', off: 'NOINHERIT', default: true },
+  { key: 'replication', on: 'REPLICATION', off: 'NOREPLICATION', default: false },
+  { key: 'bypassRls', on: 'BYPASSRLS', off: 'NOBYPASSRLS', default: false },
+]
+
+/** The first problem with a role draft, in plain English, or null. `taken` lists the other existing roles. */
+export function roleProblem(draft: RoleDraft, options: { taken: string[] }): string | null {
+  const name = draft.name.trim()
+  const nameError = nameProblem(name, options.taken)
+  if (nameError) return nameError
+  if (name.startsWith('pg_')) return 'Names starting with pg_ are reserved.'
+  if (draft.password === '') return 'Enter a password or leave it unchanged.'
+  for (const setting of draft.settings) {
+    const problem = settingNameProblem(setting.name)
+    if (problem) return `Setting "${setting.name.trim()}": ${problem}`
+  }
+  const limit = draft.connectionLimit
+  if (limit !== null && (!Number.isInteger(limit) || limit < 0)) {
+    return 'Connection limit must be a whole number, 0 or more. Leave it empty for no limit.'
+  }
+  const until = draft.validUntil?.trim()
+  if (until && (!VALID_UNTIL.test(until) || Number.isNaN(Date.parse(until)))) {
+    return 'Expiry must be a date or a date and time, such as 2030-12-31 or 2030-12-31T23:59:00Z.'
+  }
+  if (draft.memberOf.includes(name)) return 'A role cannot be a member of itself.'
+  return null
+}
+
+/**
+ * CREATE ROLE with its attributes, then GRANT per group, COMMENT ON ROLE and one ALTER ROLE ... SET
+ * per setting. LOGIN or NOLOGIN is always written; other attributes only when they differ from the
+ * default. `passwordSql` is a quoted literal (the server passes a SCRAM verifier), or null for none.
+ * Throws on a problem that roleProblem reports.
+ */
+export function createRoleSql(draft: RoleDraft, passwordSql: string | null): string[] {
+  const problem = roleProblem(draft, { taken: [] })
+  if (problem) throw new Error(`CREATE ROLE: ${problem}`)
+  const target = quoteIdent(draft.name.trim())
+  const clauses = ROLE_FLAGS.filter((f) => f.key === 'canLogin' || draft[f.key] !== f.default).map((f) =>
+    draft[f.key] ? f.on : f.off,
+  )
+  if (draft.connectionLimit !== null) clauses.push(`CONNECTION LIMIT ${draft.connectionLimit}`)
+  const until = draft.validUntil?.trim()
+  if (until) clauses.push(`VALID UNTIL ${quoteLiteral(until)}`)
+  if (passwordSql) clauses.push(`PASSWORD ${passwordSql}`)
+
+  const out = [`CREATE ROLE ${target} WITH ${clauses.join(' ')}`]
+  for (const group of new Set(draft.memberOf)) out.push(`GRANT ${quoteIdent(group)} TO ${target}`)
+  const comment = draft.comment?.trim() ?? ''
+  if (comment) out.push(commentSql(`ROLE ${target}`, comment))
+  out.push(...settingsSql(`ALTER ROLE ${target}`, [], draft.settings))
+  return out
+}
+
+/**
+ * The ALTER ROLE statements that take `before` to `after`, only for what changed, in this order:
+ * attributes, password, membership, comment, settings, then RENAME last (so the earlier statements
+ * still use the current name). `passwordSql` is null to leave the password alone. Throws when a
+ * setting name is invalid.
+ */
+export function alterRoleSql(before: RoleInfo, after: RoleDraft, passwordSql: string | null): string[] {
+  const from = quoteIdent(before.name)
+  const out: string[] = []
+  const attrs = ROLE_FLAGS.filter((f) => before[f.key] !== after[f.key]).map((f) => (after[f.key] ? f.on : f.off))
+  const limitBefore = before.connectionLimit ?? -1
+  const limitAfter = after.connectionLimit ?? -1
+  if (limitAfter !== limitBefore) attrs.push(`CONNECTION LIMIT ${limitAfter}`)
+  const untilAfter = after.validUntil?.trim() || null
+  if (untilAfter !== (before.validUntil ?? null)) {
+    attrs.push(`VALID UNTIL ${untilAfter ? quoteLiteral(untilAfter) : "'infinity'"}`)
+  }
+  if (attrs.length) out.push(`ALTER ROLE ${from} WITH ${attrs.join(' ')}`)
+  if (passwordSql) out.push(`ALTER ROLE ${from} WITH PASSWORD ${passwordSql}`)
+
+  for (const group of after.memberOf.filter((g) => !before.memberOf.includes(g)).sort()) {
+    out.push(`GRANT ${quoteIdent(group)} TO ${from}`)
+  }
+  for (const group of before.memberOf.filter((g) => !after.memberOf.includes(g)).sort()) {
+    out.push(`REVOKE ${quoteIdent(group)} FROM ${from}`)
+  }
+
+  const commentAfter = (after.comment ?? '').trim()
+  if (commentAfter !== (before.comment ?? '').trim()) out.push(commentSql(`ROLE ${from}`, commentAfter))
+  out.push(...settingsSql(`ALTER ROLE ${from}`, before.settings, after.settings))
+
+  const next = after.name.trim()
+  if (next !== before.name) out.push(`ALTER ROLE ${from} RENAME TO ${quoteIdent(next)}`)
+  return out
+}
+
+/**
+ * DROP ROLE, preceded by REASSIGN OWNED BY (when `reassignTo` is set) and DROP OWNED BY (when
+ * `dropOwned` is set). Both owned-object statements act only on the database they run in.
+ */
+export function dropRoleSql(name: string, reassignTo: string | null, dropOwned: boolean): string[] {
+  const from = quoteIdent(name)
+  const out: string[] = []
+  if (reassignTo) out.push(`REASSIGN OWNED BY ${from} TO ${quoteIdent(reassignTo)}`)
+  if (dropOwned) out.push(`DROP OWNED BY ${from}`)
+  out.push(`DROP ROLE ${from}`)
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Role privileges (what a role may do on databases and in schemas)
+// ---------------------------------------------------------------------------
+
+/** The counts that decide a schema's level (the fields of RolePrivileges, without name and level). */
+export type SchemaAccessCounts = Omit<RolePrivileges['schemas'][number], 'name' | 'level'>
+
+/**
+ * The level of a schema from what the role has. `none`: no USAGE, no table privileges (not even a
+ * partial write) and no default privileges that write. `read`: USAGE, SELECT on every table, no
+ * table privilege that writes, and default privileges that are read only. `write`: USAGE, SELECT,
+ * INSERT, UPDATE and DELETE on every table, and default privileges for all four (any extra
+ * TRUNCATE is fine). Anything else is `custom`, so a partial write is never hidden. A schema with
+ * no tables is decided by USAGE and the default privileges only.
+ */
+export function schemaAccessLevel(c: SchemaAccessCounts): SchemaAccessLevel {
+  const allRead = c.canRead === c.tables
+  if (!c.usage && c.canRead === 0 && c.anyWrite === 0 && !c.futureRead && !c.futureAnyWrite) return 'none'
+  if (c.usage && allRead && c.canWrite === c.tables && c.futureWrite) return 'write'
+  if (c.usage && allRead && c.anyWrite === 0 && c.futureRead && !c.futureAnyWrite) return 'read'
+  return 'custom'
+}
+
+type SchemaLevel = RolePrivilegesDraft['schemas'][number]['level']
+
+const DATABASE_SWITCHES = [
+  { key: 'connect', privilege: 'CONNECT' },
+  { key: 'create', privilege: 'CREATE' },
+  { key: 'temporary', privilege: 'TEMPORARY' },
+] as const
+
+/** The statements that give a role one schema level. `role` and `schema` are already quoted. */
+function schemaLevelSql(role: string, schema: string, level: SchemaLevel): string[] {
+  const tables = `ALL TABLES IN SCHEMA ${schema}`
+  const sequences = `ALL SEQUENCES IN SCHEMA ${schema}`
+  // Default privileges apply to objects that the role running these statements creates later.
+  const defaults = `ALTER DEFAULT PRIVILEGES IN SCHEMA ${schema}`
+  switch (level) {
+    case 'none':
+      return [
+        `REVOKE ALL ON ${tables} FROM ${role}`,
+        `REVOKE ALL ON ${sequences} FROM ${role}`,
+        `REVOKE ALL ON SCHEMA ${schema} FROM ${role}`,
+        `${defaults} REVOKE ALL ON TABLES FROM ${role}`,
+        `${defaults} REVOKE ALL ON SEQUENCES FROM ${role}`,
+      ]
+    case 'read':
+      return [
+        `GRANT USAGE ON SCHEMA ${schema} TO ${role}`,
+        `REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ${tables} FROM ${role}`,
+        `GRANT SELECT ON ${tables} TO ${role}`,
+        `GRANT SELECT ON ${sequences} TO ${role}`,
+        `${defaults} REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLES FROM ${role}`,
+        `${defaults} GRANT SELECT ON TABLES TO ${role}`,
+        `${defaults} GRANT SELECT ON SEQUENCES TO ${role}`,
+      ]
+    case 'write':
+      return [
+        `GRANT USAGE ON SCHEMA ${schema} TO ${role}`,
+        `GRANT SELECT, INSERT, UPDATE, DELETE ON ${tables} TO ${role}`,
+        `GRANT USAGE, SELECT, UPDATE ON ${sequences} TO ${role}`,
+        `${defaults} GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ${role}`,
+        `${defaults} GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${role}`,
+      ]
+  }
+}
+
+/**
+ * The statements that take the role's current privileges to the draft, only for what changes.
+ * Database switches come first (one GRANT or REVOKE per database and direction), then schema
+ * levels. Only the databases and schemas listed in the draft are touched. The server runs the
+ * statements in one transaction. ALTER DEFAULT PRIVILEGES has no FOR ROLE here, so it changes the
+ * defaults for objects created later by the role that runs the statements (pow/view's user).
+ * Throws when the draft names a database or schema that is not in `current`.
+ */
+export function rolePrivilegesSql(current: RolePrivileges, draft: RolePrivilegesDraft): string[] {
+  const role = quoteIdent(current.role)
+  const out: string[] = []
+  for (const wanted of draft.databases) {
+    const before = current.databases.find((d) => d.name === wanted.name)
+    if (!before) throw new Error(`Database "${wanted.name}" was not found.`)
+    const grant: string[] = []
+    const revoke: string[] = []
+    for (const { key, privilege } of DATABASE_SWITCHES) {
+      if (wanted[key] === before[key]) continue
+      if (wanted[key]) grant.push(privilege)
+      else revoke.push(privilege)
+    }
+    const target = `DATABASE ${quoteIdent(wanted.name)}`
+    if (grant.length) out.push(`GRANT ${grant.join(', ')} ON ${target} TO ${role}`)
+    if (revoke.length) out.push(`REVOKE ${revoke.join(', ')} ON ${target} FROM ${role}`)
+  }
+  for (const wanted of draft.schemas) {
+    const before = current.schemas.find((s) => s.name === wanted.name)
+    if (!before) throw new Error(`Schema "${wanted.name}" was not found.`)
+    if (wanted.level !== before.level) out.push(...schemaLevelSql(role, quoteIdent(wanted.name), wanted.level))
+  }
+  return out
 }

@@ -1,10 +1,12 @@
 import { kindFromPgType } from '@/lib/pg-types'
-import { describedColumnSql } from '@/lib/ddl'
+import { DATABASE_ENCODINGS, describedColumnSql } from '@/lib/ddl'
 import { qualifiedName, quoteIdent } from '@/lib/sql'
 import type {
   ColumnInfo,
   ConstraintInfo,
+  DatabaseCreateOptions,
   DatabaseInfo,
+  DatabaseSetting,
   FunctionInfo,
   IndexInfo,
   ReferenceInfo,
@@ -68,17 +70,50 @@ export async function getServerInfo(connectionId: string, database?: string): Pr
   }
 }
 
-/** Every database on the server that accepts connections, with sizes where the role may see them. */
-export async function listDatabases(connectionId: string): Promise<DatabaseInfo[]> {
-  const rows = await query<{ name: string; size: string | null; owner: string; is_current: boolean }>(
+/**
+ * Databases on the server with their settings and sizes (sizes only where the role may see them).
+ * By default only the databases that accept connections and are not templates. `all` adds the
+ * templates and closed databases; template0 stays hidden because it can never be changed.
+ */
+export async function listDatabases(connectionId: string, options: { all?: boolean } = {}): Promise<DatabaseInfo[]> {
+  const rows = await query<{
+    name: string
+    size: string | null
+    owner: string
+    is_current: boolean
+    encoding: string
+    collate: string
+    ctype: string
+    tablespace: string
+    connection_limit: number | null
+    allow_connections: boolean
+    is_template: boolean
+    comment: string | null
+    sessions: number
+    can_manage: boolean
+    settings: string[] | null
+  }>(
     connectionId,
     undefined,
     `SELECT d.datname AS name,
             CASE WHEN has_database_privilege(d.datname, 'CONNECT') THEN pg_database_size(d.datname) END AS size,
             pg_get_userbyid(d.datdba) AS owner,
-            d.datname = current_database() AS is_current
+            d.datname = current_database() AS is_current,
+            pg_encoding_to_char(d.encoding) AS encoding,
+            d.datcollate AS collate,
+            d.datctype AS ctype,
+            t.spcname AS tablespace,
+            CASE WHEN d.datconnlimit = -1 THEN NULL ELSE d.datconnlimit END AS connection_limit,
+            d.datallowconn AS allow_connections,
+            d.datistemplate AS is_template,
+            shobj_description(d.oid, 'pg_database') AS comment,
+            (SELECT count(*)::int FROM pg_stat_activity a WHERE a.datname = d.datname) AS sessions,
+            (EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname = current_user AND r.rolsuper)
+              OR pg_has_role(current_user, d.datdba, 'MEMBER')) AS can_manage,
+            (SELECT s.setconfig FROM pg_db_role_setting s WHERE s.setdatabase = d.oid AND s.setrole = 0) AS settings
        FROM pg_database d
-      WHERE d.datallowconn AND NOT d.datistemplate
+       JOIN pg_tablespace t ON t.oid = d.dattablespace
+      WHERE ${options.all ? "d.datname <> 'template0'" : 'd.datallowconn AND NOT d.datistemplate'}
       ORDER BY d.datname`,
   )
   return rows.map((r) => ({
@@ -86,7 +121,99 @@ export async function listDatabases(connectionId: string): Promise<DatabaseInfo[
     size: numOrNull(r.size),
     owner: r.owner,
     isCurrent: r.is_current,
+    encoding: r.encoding,
+    collate: r.collate,
+    ctype: r.ctype,
+    tablespace: r.tablespace,
+    connectionLimit: r.connection_limit,
+    allowConnections: r.allow_connections,
+    isTemplate: r.is_template,
+    comment: r.comment,
+    sessions: r.sessions,
+    canManage: r.can_manage,
+    settings: parseSettings(r.settings),
   }))
+}
+
+/** Splits the "name=value" entries of pg_db_role_setting at the first '='. */
+export function parseSettings(entries: string[] | null): DatabaseSetting[] {
+  return (entries ?? [])
+    .map((entry) => {
+      const at = entry.indexOf('=')
+      return at < 0 ? { name: entry, value: '' } : { name: entry.slice(0, at), value: entry.slice(at + 1) }
+    })
+    .sort((a, b) => a.name.localeCompare(b.name))
+}
+
+/** Roles that can own a database. PostgreSQL's built-in pg_ roles are left out. */
+export async function listRoles(connectionId: string): Promise<string[]> {
+  const rows = await query<{ name: string }>(
+    connectionId,
+    undefined,
+    `SELECT rolname AS name FROM pg_roles WHERE rolname !~ '^pg_' ORDER BY rolname`,
+  )
+  return rows.map((r) => r.name)
+}
+
+/** server_version_num, e.g. 170002 for PostgreSQL 17.2. */
+export async function serverVersionNum(connectionId: string): Promise<number> {
+  const [row] = await query<{ version_num: number }>(
+    connectionId,
+    undefined,
+    `SELECT current_setting('server_version_num')::int AS version_num`,
+  )
+  if (!row) throw new Error('Could not read the server version')
+  return row.version_num
+}
+
+/** The choices for the New database dialog. Only the options the server version has are useful; the dialog hides the rest. */
+export async function getDatabaseCreateOptions(connectionId: string): Promise<DatabaseCreateOptions> {
+  const versionNum = await serverVersionNum(connectionId)
+  // The ICU locale column was renamed in PostgreSQL 17. ICU collations only exist from 15 on.
+  const icuColumn = versionNum >= 170000 ? 'colllocale' : 'colliculocale'
+  const provider =
+    versionNum >= 150000 ? `CASE datlocprovider WHEN 'i' THEN 'icu' WHEN 'b' THEN 'builtin' ELSE 'libc' END` : `'libc'`
+  const [tablespaces, libc, icu, template] = await Promise.all([
+    query<{ name: string }>(
+      connectionId,
+      undefined,
+      `SELECT spcname AS name FROM pg_tablespace WHERE spcname <> 'pg_global' ORDER BY spcname`,
+    ),
+    query<{ locale: string }>(
+      connectionId,
+      undefined,
+      `SELECT DISTINCT collcollate AS locale FROM pg_collation WHERE collprovider = 'c' AND collcollate IS NOT NULL`,
+    ),
+    versionNum >= 150000
+      ? query<{ locale: string }>(
+          connectionId,
+          undefined,
+          `SELECT DISTINCT ${icuColumn} AS locale FROM pg_collation WHERE collprovider = 'i' AND ${icuColumn} IS NOT NULL`,
+        )
+      : Promise.resolve([]),
+    query<{ encoding: string; collate: string; ctype: string; provider: string }>(
+      connectionId,
+      undefined,
+      `SELECT pg_encoding_to_char(encoding) AS encoding, datcollate AS collate, datctype AS ctype,
+              ${provider} AS provider
+         FROM pg_database WHERE datname = 'template1'`,
+    ),
+  ])
+  const [defaults] = template
+  if (!defaults) throw new Error('Could not read the defaults of template1')
+  return {
+    versionNum,
+    tablespaces: tablespaces.map((r) => r.name),
+    encodings: DATABASE_ENCODINGS,
+    libcLocales: [...new Set([...libc.map((r) => r.locale), 'C', 'POSIX'])].sort(),
+    icuLocales: [...new Set(icu.map((r) => r.locale))].sort(),
+    templateDefaults: {
+      encoding: defaults.encoding,
+      collate: defaults.collate,
+      ctype: defaults.ctype,
+      localeProvider: defaults.provider,
+    },
+  }
 }
 
 export async function listSchemas(connectionId: string, database: string): Promise<SchemaInfo[]> {
@@ -104,7 +231,8 @@ export async function listSchemas(connectionId: string, database: string): Promi
             obj_description(n.oid, 'pg_namespace') AS comment,
             (n.nspname IN ('pg_catalog', 'information_schema')) AS is_system,
             (SELECT count(*)::int FROM pg_class c
-              WHERE c.relnamespace = n.oid AND c.relkind IN ('r', 'p', 'v', 'm', 'f')) AS relation_count
+              WHERE c.relnamespace = n.oid AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                AND ${NOT_EXTENSION_MEMBER('c.oid', 'pg_class')}) AS relation_count
        FROM pg_namespace n
       WHERE n.nspname !~ '^pg_toast' AND n.nspname !~ '^pg_temp_'
       ORDER BY is_system, (n.nspname = 'public') DESC, n.nspname`,
@@ -118,7 +246,8 @@ export async function listSchemas(connectionId: string, database: string): Promi
   }))
 }
 
-const NOT_EXTENSION_MEMBER = (oidExpr: string, catalog: string) =>
+/** SQL that is true when the object does not belong to an extension (the sidebar, palette and diagram leave those out). */
+export const NOT_EXTENSION_MEMBER = (oidExpr: string, catalog: string) =>
   `NOT EXISTS (SELECT 1 FROM pg_depend dep
                 WHERE dep.objid = ${oidExpr} AND dep.classid = '${catalog}'::regclass AND dep.deptype = 'e')`
 
@@ -721,21 +850,23 @@ export async function getCompletionSchema(
 interface DatabaseOverview {
   counts: { tables: number; views: number; matviews: number; functions: number; schemas: number }
   largest: { schema: string; name: string; kind: RelationKind; bytes: number; rows: number | null }[]
-  sessions: { state: string; count: number }[]
   cacheHitRatio: number | null
   extensions: { name: string; version: string }[]
 }
 
 export async function getDatabaseOverview(connectionId: string, database: string): Promise<DatabaseOverview> {
   const userSchemas = `n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_toast' AND n.nspname !~ '^pg_temp_'`
-  const [counts, largest, sessions, cache, extensions] = await Promise.all([
+  const [counts, largest, cache, extensions] = await Promise.all([
     query<{ tables: number; views: number; matviews: number; functions: number; schemas: number }>(
       connectionId,
       database,
       `SELECT
-         (SELECT count(*)::int FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition AND ${userSchemas}) AS tables,
-         (SELECT count(*)::int FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'v' AND ${userSchemas}) AS views,
-         (SELECT count(*)::int FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'm' AND ${userSchemas}) AS matviews,
+         (SELECT count(*)::int FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition AND ${userSchemas}
+             AND ${NOT_EXTENSION_MEMBER('c.oid', 'pg_class')}) AS tables,
+         (SELECT count(*)::int FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'v' AND ${userSchemas}
+             AND ${NOT_EXTENSION_MEMBER('c.oid', 'pg_class')}) AS views,
+         (SELECT count(*)::int FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'm' AND ${userSchemas}
+             AND ${NOT_EXTENSION_MEMBER('c.oid', 'pg_class')}) AS matviews,
          (SELECT count(*)::int FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE ${userSchemas}
              AND ${NOT_EXTENSION_MEMBER('p.oid', 'pg_proc')}) AS functions,
          (SELECT count(*)::int FROM pg_namespace n WHERE ${userSchemas}) AS schemas`,
@@ -758,13 +889,6 @@ export async function getDatabaseOverview(connectionId: string, database: string
         ORDER BY 4 DESC NULLS LAST
         LIMIT 8`,
     ),
-    query<{ state: string; count: number }>(
-      connectionId,
-      database,
-      `SELECT coalesce(state, 'background') AS state, count(*)::int AS count
-         FROM pg_stat_activity WHERE datname = current_database()
-        GROUP BY 1 ORDER BY 2 DESC`,
-    ).catch(() => []),
     query<{ ratio: number | null }>(
       connectionId,
       database,
@@ -781,7 +905,6 @@ export async function getDatabaseOverview(connectionId: string, database: string
   return {
     counts: counts[0]!,
     largest: largest.map((r) => ({ ...r, bytes: num(r.bytes) })),
-    sessions,
     cacheHitRatio: cache[0]?.ratio ?? null,
     extensions,
   }

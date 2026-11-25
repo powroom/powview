@@ -8,7 +8,10 @@ import {
   countRowsFn,
   fetchRowsFn,
   lookupReferencesFn,
+  listAllDatabasesFn,
   listDatabasesFn,
+  listRoleDetailsFn,
+  listRolesFn,
   listSchemasFn,
   objectDefinitionFn,
   relationDdlFn,
@@ -17,7 +20,9 @@ import {
   serverInfoFn,
   completionSchemaFn,
   databaseOverviewFn,
+  databaseCreateOptionsFn,
   databaseHealthFn,
+  rolePrivilegesFn,
 } from '@/api/explorer.functions'
 import type { Filter, Sort } from './types'
 
@@ -29,6 +34,7 @@ export const keys = {
   /** prefix for everything that belongs to one database */
   db: (id: string, db: string) => ['c', id, db] as const,
   databases: (id: string) => ['c', id, '~databases'] as const,
+  roles: (id: string) => ['c', id, '~roles'] as const,
   relation: (id: string, db: string, schema: string, table: string) => ['c', id, db, 'rel', schema, table] as const,
 }
 
@@ -80,6 +86,41 @@ export const databasesQuery = (connectionId: string) =>
   queryOptions({
     queryKey: keys.databases(connectionId),
     queryFn: () => listDatabasesFn({ data: { connectionId } }),
+  })
+
+/** Every database, templates and closed ones included (the Databases page). */
+export const allDatabasesQuery = (connectionId: string) =>
+  queryOptions({
+    queryKey: [...keys.databases(connectionId), 'all'],
+    queryFn: () => listAllDatabasesFn({ data: { connectionId } }),
+  })
+
+/** What the New database dialog can offer on this server: version, encodings, locales, tablespaces. */
+export const databaseCreateOptionsQuery = (connectionId: string) =>
+  queryOptions({
+    queryKey: [...keys.databases(connectionId), 'create-options'],
+    queryFn: () => databaseCreateOptionsFn({ data: { connectionId } }),
+  })
+
+/** Role names that can own a database. */
+export const rolesQuery = (connectionId: string) =>
+  queryOptions({
+    queryKey: keys.roles(connectionId),
+    queryFn: () => listRolesFn({ data: { connectionId } }),
+  })
+
+/** Every role with its attributes, memberships and sessions (the Roles page and the role forms). */
+export const roleDetailsQuery = (connectionId: string) =>
+  queryOptions({
+    queryKey: [...keys.roles(connectionId), 'details'],
+    queryFn: () => listRoleDetailsFn({ data: { connectionId } }),
+  })
+
+/** The privileges of one role in the open database: database switches and schema levels. */
+export const rolePrivilegesQuery = (connectionId: string, database: string, role: string) =>
+  queryOptions({
+    queryKey: [...keys.db(connectionId, database), 'role-privileges', role],
+    queryFn: () => rolePrivilegesFn({ data: { connectionId, database, role } }),
   })
 
 export const serverInfoQuery = (connectionId: string, database: string) =>

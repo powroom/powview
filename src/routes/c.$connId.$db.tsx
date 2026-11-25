@@ -153,7 +153,18 @@ function WorkspaceHeader({
   const params = useParams({ strict: false }) as { schema?: string; table?: string }
   const onSql = Boolean(matchRoute({ to: '/c/$connId/$db/sql', fuzzy: true }))
   const onDiagram = Boolean(matchRoute({ to: '/c/$connId/$db/diagram', fuzzy: true }))
-  const pageLabel = onSql ? 'SQL editor' : onDiagram ? 'Diagram' : 'Overview'
+  const onDatabases = Boolean(matchRoute({ to: '/c/$connId/$db/databases', fuzzy: true }))
+  const onRoles = Boolean(matchRoute({ to: '/c/$connId/$db/roles', fuzzy: true }))
+  const onServerPage = onDatabases || onRoles
+  const pageLabel = onSql
+    ? 'SQL editor'
+    : onDiagram
+      ? 'Diagram'
+      : onDatabases
+        ? 'Databases'
+        : onRoles
+          ? 'Roles'
+          : 'Overview'
 
   const openNewQuery = () => {
     openSqlTab(connection.id, '')
@@ -176,14 +187,20 @@ function WorkspaceHeader({
             <BreadcrumbItem className="min-w-4.5">
               <BreadcrumbLink
                 className="flex min-w-4.5 items-center gap-1.5"
-                render={<Link params={{ connId: connection.id, db: database }} to="/c/$connId/$db" />}
+                render={
+                  <Link
+                    params={{ connId: connection.id, db: database }}
+                    to={onServerPage ? '/c/$connId/$db/databases' : '/c/$connId/$db'}
+                  />
+                }
               >
                 <ConnectionAvatar
                   className="size-4.5 rounded text-[0.55rem]"
                   color={connection.color}
                   name={connection.name}
                 />
-                <span className="truncate">{database}</span>
+                {/* server pages (Databases, Roles) belong to the connection, not to the open database */}
+                <span className="truncate">{onServerPage ? connection.name : database}</span>
               </BreadcrumbLink>
             </BreadcrumbItem>
             {params.schema && params.table ? (

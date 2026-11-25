@@ -173,11 +173,193 @@ export interface ServerInfo {
   readOnly: boolean
 }
 
+/** A database-level setting from ALTER DATABASE ... SET (not tied to a role). */
+export interface DatabaseSetting {
+  name: string
+  value: string
+}
+
 export interface DatabaseInfo {
   name: string
   size: number | null
   owner: string
   isCurrent: boolean
+  encoding: string
+  collate: string
+  ctype: string
+  tablespace: string
+  /** null = no limit (PostgreSQL stores -1) */
+  connectionLimit: number | null
+  allowConnections: boolean
+  isTemplate: boolean
+  comment: string | null
+  /** sessions connected to the database; 0 when none, or when this role cannot see them */
+  sessions: number
+  /** superuser, or a member of the owning role: may change or drop the database */
+  canManage: boolean
+  settings: DatabaseSetting[]
+}
+
+/** Everything the New database dialog needs about the server. */
+export interface DatabaseCreateOptions {
+  /** server_version_num, e.g. 170002 */
+  versionNum: number
+  tablespaces: string[]
+  /** server-side encodings PostgreSQL accepts for a database */
+  encodings: string[]
+  /** libc locales from pg_collation, plus C and POSIX */
+  libcLocales: string[]
+  /** ICU locales from pg_collation; [] on servers without ICU or before PostgreSQL 15 */
+  icuLocales: string[]
+  /** what a copy of template1 inherits */
+  templateDefaults: { encoding: string; collate: string; ctype: string; localeProvider: string }
+}
+
+/** The wanted state of a new database. Null or the default means "leave the clause out". */
+export interface DatabaseCreateDraft {
+  name: string
+  /** null: the current user (no OWNER clause) */
+  owner: string | null
+  /** null: template1 (no TEMPLATE clause); 'template0' for a clean database; any other name copies it */
+  template: string | null
+  encoding: string | null
+  localeProvider: 'libc' | 'icu' | 'builtin' | null
+  /** LOCALE, which sets both LC_COLLATE and LC_CTYPE for libc */
+  locale: string | null
+  lcCollate: string | null
+  lcCtype: string | null
+  icuLocale: string | null
+  icuRules: string | null
+  builtinLocale: string | null
+  collationVersion: string | null
+  tablespace: string | null
+  strategy: 'wal_log' | 'file_copy' | null
+  /** default true: no clause unless false */
+  allowConnections: boolean
+  /** null: no limit (no clause) */
+  connectionLimit: number | null
+  /** default false: no clause unless true */
+  isTemplate: boolean
+  oid: number | null
+  comment: string | null
+  settings: { name: string; value: string }[]
+}
+
+/** The outcome of an ALTER or DROP DATABASE run. */
+export interface DatabaseAdminResult {
+  ok: boolean
+  /** every statement that was planned, in the order they run */
+  statements: string[]
+  /** how many statements finished before the end or the error */
+  ran: number
+  /** the statement that failed, or null */
+  failedStatement: string | null
+  error: PgErrorInfo | null
+}
+
+/** The result of a role change. Same shape as a database change; SQL errors come back here. */
+export type RoleAdminResult = DatabaseAdminResult
+
+/** A PostgreSQL role (users and groups) with what the Roles page shows. */
+export interface RoleInfo {
+  name: string
+  canLogin: boolean
+  superuser: boolean
+  createDb: boolean
+  createRole: boolean
+  inherit: boolean
+  replication: boolean
+  bypassRls: boolean
+  /** null when unlimited (PostgreSQL stores -1) */
+  connectionLimit: number | null
+  /** ISO timestamp in UTC, null when the role never expires ('infinity' counts as null) */
+  validUntil: string | null
+  /** roles this role is a member of, sorted */
+  memberOf: string[]
+  /** roles that are members of this one, sorted */
+  members: string[]
+  comment: string | null
+  /** pg_stat_activity rows for this role */
+  sessions: number
+  /** role-level settings (ALTER ROLE ... SET), not tied to a database */
+  settings: DatabaseSetting[]
+  isCurrentUser: boolean
+  /** null when the current role may not read pg_authid (not a superuser) */
+  hasPassword: boolean | null
+}
+
+/** The wanted state of a role. The server builds the SQL from it; the client never sends SQL. */
+export interface RoleDraft {
+  name: string
+  canLogin: boolean
+  /** null: leave the password as it is (edit) or set none (create). '' is not allowed. */
+  password: string | null
+  superuser: boolean
+  createDb: boolean
+  createRole: boolean
+  inherit: boolean
+  replication: boolean
+  bypassRls: boolean
+  /** null: no limit */
+  connectionLimit: number | null
+  /** ISO date or date and time; null: no expiry */
+  validUntil: string | null
+  memberOf: string[]
+  comment: string | null
+  settings: DatabaseSetting[]
+}
+
+/** What a role may do in one schema: none, read (SELECT only), write (read and change), or custom (anything else). */
+export type SchemaAccessLevel = 'none' | 'read' | 'write' | 'custom'
+
+/**
+ * The privileges of one role, from explicit grants only (PUBLIC is reported apart). Database
+ * switches cover the whole server; schema levels cover the database that is open in the app.
+ */
+export interface RolePrivileges {
+  role: string
+  /** superusers bypass every privilege check, so the UI shows a note instead of switches */
+  superuser: boolean
+  /** the user pow/view connects as: default privileges apply to its new objects */
+  currentUser: string
+  databases: {
+    name: string
+    connect: boolean
+    create: boolean
+    temporary: boolean
+    /** PUBLIC can connect to every database by default */
+    publicConnect: boolean
+    publicTemporary: boolean
+  }[]
+  schemas: {
+    name: string
+    level: SchemaAccessLevel
+    usage: boolean
+    /** tables, partitioned tables, views, materialized views and foreign tables (not partitions) */
+    tables: number
+    /** how many of those the role may SELECT */
+    canRead: number
+    /** how many of those the role may INSERT, UPDATE and DELETE (all three) */
+    canWrite: number
+    /** how many of those the role has at least one of INSERT, UPDATE, DELETE and TRUNCATE on */
+    anyWrite: number
+    /** default privileges for new tables are exactly read: SELECT, and no INSERT, UPDATE, DELETE or TRUNCATE */
+    futureRead: boolean
+    /** default privileges for new tables include SELECT, INSERT, UPDATE and DELETE */
+    futureWrite: boolean
+    /** default privileges for new tables include at least one of INSERT, UPDATE, DELETE and TRUNCATE */
+    futureAnyWrite: boolean
+  }[]
+}
+
+/**
+ * The wanted privileges of one role. Only the databases and schemas listed are touched: a schema
+ * left out keeps its current privileges.
+ */
+export interface RolePrivilegesDraft {
+  databases: { name: string; connect: boolean; create: boolean; temporary: boolean }[]
+  /** only the schemas the user changed; `custom` is not a level that can be chosen */
+  schemas: { name: string; level: Exclude<SchemaAccessLevel, 'custom'> }[]
 }
 
 export interface SchemaInfo {

@@ -1,7 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { Link, createFileRoute } from '@tanstack/react-router'
 import {
-  ActivityIcon,
   ClockIcon,
   GaugeIcon,
   HardDriveIcon,
@@ -203,26 +202,6 @@ function Overview() {
                   <p className="px-3 py-6 text-center text-muted-foreground text-sm">
                     Tables you open show up here. Press <Kbd>{modKey} K</Kbd> to jump to any table.
                   </p>
-                )}
-              </FramePanel>
-            </Frame>
-
-            <Frame>
-              <FrameHeader className="flex-row items-center gap-2 py-3">
-                <ActivityIcon aria-hidden="true" className="size-4 opacity-60" />
-                <FrameTitle>Sessions</FrameTitle>
-              </FrameHeader>
-              <FramePanel className="flex flex-wrap gap-2 p-4">
-                {isPending ? (
-                  <BadgeSkeleton />
-                ) : overview?.sessions.length ? (
-                  overview.sessions.map((s) => (
-                    <Badge key={s.state} size="lg" variant={s.state === 'active' ? 'success' : 'secondary'}>
-                      {s.state} <span className="tabular-nums opacity-72">{s.count}</span>
-                    </Badge>
-                  ))
-                ) : (
-                  <span className="text-muted-foreground text-sm">No visible sessions.</span>
                 )}
               </FramePanel>
             </Frame>

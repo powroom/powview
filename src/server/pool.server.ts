@@ -112,6 +112,15 @@ export async function closePools(connectionId: string): Promise<void> {
   await closeTunnel(connectionId)
 }
 
+/** Closes the pool of one database of a connection. RENAME and DROP need the database to have no sessions. */
+export async function closeDatabasePool(connectionId: string, database: string): Promise<void> {
+  const key = `${connectionId}::${database}`
+  const entry = pools.get(key)
+  if (!entry) return
+  pools.delete(key)
+  await entry.pool.end().catch(() => {})
+}
+
 /** Ids of the connections with a checked-out database connection or an open SSH session. */
 export function connectedIds(): string[] {
   const ids = new Set<string>()

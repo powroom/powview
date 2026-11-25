@@ -3,15 +3,30 @@ import {
   addColumnSql,
   addConstraintSql,
   alterColumnSql,
+  alterDatabaseSql,
+  alterRoleSql,
+  createDatabaseProblem,
   createDatabaseSql,
   createIndexSql,
+  createRoleSql,
   createSchemaSql,
   createTableSql,
   ddlScript,
   defaultExpression,
   describedColumnSql,
+  dropDatabaseSql,
+  dropRoleSql,
+  PASSWORD_MASK,
+  roleProblem,
+  rolePrivilegesSql,
+  schemaAccessLevel,
+  type SchemaAccessCounts,
   schemaNameProblem,
+  settingNameProblem,
+  type DatabaseDraft,
+  type DatabaseFields,
 } from './ddl'
+import type { DatabaseCreateDraft, RoleDraft, RoleInfo, RolePrivileges, RolePrivilegesDraft } from './types'
 
 const col = (over: Partial<Parameters<typeof addColumnSql>[2]> = {}) => ({
   name: 'title',
@@ -142,15 +157,6 @@ describe('schemas', () => {
     expect(createSchemaSql('billing', '   ')).toEqual(['CREATE SCHEMA "billing"'])
   })
 
-  test('createDatabaseSql: a plain name', () => {
-    expect(createDatabaseSql('analytics')).toEqual(['CREATE DATABASE "analytics"'])
-  })
-
-  test('createDatabaseSql: trimmed and quoted, with double quotes, spaces and mixed case kept', () => {
-    expect(createDatabaseSql('  My "Shop"  ')).toEqual(['CREATE DATABASE "My ""Shop"""'])
-    expect(createDatabaseSql('Sales 2026')).toEqual(['CREATE DATABASE "Sales 2026"'])
-  })
-
   test('schemaNameProblem: empty, taken, pg_ prefix, valid', () => {
     expect(schemaNameProblem('  ')).toBe('Required')
     expect(schemaNameProblem('billing', ['billing'])).toBe('Already used')
@@ -158,5 +164,875 @@ describe('schemas', () => {
     // PostgreSQL only reserves the lowercase prefix
     expect(schemaNameProblem('PG_custom')).toBeNull()
     expect(schemaNameProblem('billing', ['sales'])).toBeNull()
+  })
+})
+
+describe('databases', () => {
+  const shop: DatabaseFields = {
+    name: 'shop',
+    owner: 'app',
+    comment: null,
+    connectionLimit: null,
+    allowConnections: true,
+    settings: [],
+  }
+  const draft = (over: Partial<DatabaseDraft> = {}): DatabaseDraft => ({
+    name: 'shop',
+    owner: 'app',
+    comment: null,
+    connectionLimit: null,
+    allowConnections: true,
+    ...over,
+  })
+
+  test('no change gives no statements', () => {
+    expect(alterDatabaseSql(shop, draft())).toEqual([])
+    expect(alterDatabaseSql(shop, draft({ settings: [] }))).toEqual([])
+  })
+
+  test('owner alone', () => {
+    expect(alterDatabaseSql(shop, draft({ owner: 'billing_admin' }))).toEqual([
+      'ALTER DATABASE "shop" OWNER TO "billing_admin"',
+    ])
+  })
+
+  test('connection limit: null means -1 in SQL, and back again', () => {
+    expect(alterDatabaseSql(shop, draft({ connectionLimit: 10 }))).toEqual([
+      'ALTER DATABASE "shop" CONNECTION LIMIT 10',
+    ])
+    expect(alterDatabaseSql({ ...shop, connectionLimit: 5 }, draft({ connectionLimit: null }))).toEqual([
+      'ALTER DATABASE "shop" CONNECTION LIMIT -1',
+    ])
+    expect(alterDatabaseSql(shop, draft({ connectionLimit: 0 }))).toEqual(['ALTER DATABASE "shop" CONNECTION LIMIT 0'])
+  })
+
+  test('allow connections, both ways', () => {
+    expect(alterDatabaseSql(shop, draft({ allowConnections: false }))).toEqual([
+      'ALTER DATABASE "shop" WITH ALLOW_CONNECTIONS false',
+    ])
+    expect(alterDatabaseSql({ ...shop, allowConnections: false }, draft())).toEqual([
+      'ALTER DATABASE "shop" WITH ALLOW_CONNECTIONS true',
+    ])
+  })
+
+  test('comment: set, quote, clear, and unchanged', () => {
+    expect(alterDatabaseSql(shop, draft({ comment: "Owner's shop" }))).toEqual([
+      `COMMENT ON DATABASE "shop" IS 'Owner''s shop'`,
+    ])
+    expect(alterDatabaseSql({ ...shop, comment: 'old' }, draft({ comment: '  ' }))).toEqual([
+      'COMMENT ON DATABASE "shop" IS NULL',
+    ])
+    expect(alterDatabaseSql({ ...shop, comment: 'same' }, draft({ comment: '  same  ' }))).toEqual([])
+  })
+
+  test('comment with a backslash uses an escape string', () => {
+    expect(alterDatabaseSql(shop, draft({ comment: 'C:\\data' }))).toEqual([
+      `COMMENT ON DATABASE "shop" IS E'C:\\\\data'`,
+    ])
+  })
+
+  test('settings: new and changed are SET, removed are RESET, same value is skipped', () => {
+    const before: DatabaseFields = {
+      ...shop,
+      settings: [
+        { name: 'work_mem', value: '4MB' },
+        { name: 'statement_timeout', value: '5s' },
+        { name: 'search_path', value: 'app' },
+      ],
+    }
+    const out = alterDatabaseSql(
+      before,
+      draft({
+        settings: [
+          { name: 'work_mem', value: '64MB' },
+          { name: 'search_path', value: 'app' },
+          { name: 'app.tenant', value: "it's" },
+        ],
+      }),
+    )
+    expect(out).toEqual([
+      `ALTER DATABASE "shop" SET work_mem = '64MB'`,
+      `ALTER DATABASE "shop" SET app.tenant = 'it''s'`,
+      'ALTER DATABASE "shop" RESET statement_timeout',
+    ])
+  })
+
+  test('settings left out of the draft are not touched', () => {
+    const before: DatabaseFields = { ...shop, settings: [{ name: 'work_mem', value: '4MB' }] }
+    expect(alterDatabaseSql(before, draft())).toEqual([])
+  })
+
+  test('rename alone', () => {
+    expect(alterDatabaseSql(shop, draft({ name: 'shop_2026' }))).toEqual([
+      'ALTER DATABASE "shop" RENAME TO "shop_2026"',
+    ])
+  })
+
+  test('rename comes last, so the statements before it use the old name', () => {
+    const out = alterDatabaseSql(
+      { ...shop, settings: [{ name: 'work_mem', value: '4MB' }] },
+      draft({
+        name: 'shop_2',
+        owner: 'billing',
+        connectionLimit: 3,
+        allowConnections: false,
+        comment: 'New',
+        settings: [{ name: 'work_mem', value: '8MB' }],
+      }),
+    )
+    expect(out).toEqual([
+      'ALTER DATABASE "shop" OWNER TO "billing"',
+      'ALTER DATABASE "shop" CONNECTION LIMIT 3',
+      'ALTER DATABASE "shop" WITH ALLOW_CONNECTIONS false',
+      `COMMENT ON DATABASE "shop" IS 'New'`,
+      `ALTER DATABASE "shop" SET work_mem = '8MB'`,
+      'ALTER DATABASE "shop" RENAME TO "shop_2"',
+    ])
+  })
+
+  test('odd names are quoted, and the new name is trimmed', () => {
+    const odd: DatabaseFields = { ...shop, name: 'My "Shop"' }
+    expect(alterDatabaseSql(odd, draft({ name: '  Sales 2026  ' }))).toEqual([
+      'ALTER DATABASE "My ""Shop""" RENAME TO "Sales 2026"',
+    ])
+    expect(alterDatabaseSql(odd, draft({ name: 'My "Shop"', owner: 'Ops Team' }))).toEqual([
+      'ALTER DATABASE "My ""Shop""" OWNER TO "Ops Team"',
+    ])
+  })
+
+  test('an invalid setting name throws, naming the setting', () => {
+    expect(() => alterDatabaseSql(shop, draft({ settings: [{ name: 'bad name', value: 'x' }] }))).toThrow(
+      'Setting "bad name": Use letters',
+    )
+  })
+
+  test('settingNameProblem', () => {
+    expect(settingNameProblem('  ')).toBe('Required')
+    expect(settingNameProblem('work_mem')).toBeNull()
+    expect(settingNameProblem(' app.tenant_id ')).toBeNull()
+    expect(settingNameProblem('_x1')).toBeNull()
+    expect(settingNameProblem('1abc')).not.toBeNull()
+    expect(settingNameProblem('a-b')).not.toBeNull()
+    expect(settingNameProblem('a; DROP')).not.toBeNull()
+  })
+
+  test('dropDatabaseSql, with and without force', () => {
+    expect(dropDatabaseSql('shop', false)).toBe('DROP DATABASE "shop"')
+    expect(dropDatabaseSql('shop', true)).toBe('DROP DATABASE "shop" WITH (FORCE)')
+    expect(dropDatabaseSql('My "Shop"', false)).toBe('DROP DATABASE "My ""Shop"""')
+  })
+
+  test('dropDatabaseSql, with and without force', () => {
+    expect(dropDatabaseSql('shop', false)).toBe('DROP DATABASE "shop"')
+    expect(dropDatabaseSql('shop', true)).toBe('DROP DATABASE "shop" WITH (FORCE)')
+    expect(dropDatabaseSql('My "Shop"', false)).toBe('DROP DATABASE "My ""Shop"""')
+  })
+})
+
+describe('create database', () => {
+  const V = { 14: 140008, 15: 150000, 16: 160000, 17: 170002, 18: 180000 }
+  const draft = (over: Partial<DatabaseCreateDraft> = {}): DatabaseCreateDraft => ({
+    name: 'analytics',
+    owner: null,
+    template: null,
+    encoding: null,
+    localeProvider: null,
+    locale: null,
+    lcCollate: null,
+    lcCtype: null,
+    icuLocale: null,
+    icuRules: null,
+    builtinLocale: null,
+    collationVersion: null,
+    tablespace: null,
+    strategy: null,
+    allowConnections: true,
+    connectionLimit: null,
+    isTemplate: false,
+    oid: null,
+    comment: null,
+    settings: [],
+    ...over,
+  })
+  const withOptions = (clauses: string, name = 'analytics') => `CREATE DATABASE "${name}" WITH ${clauses}`
+
+  test('the simple case is one statement with no WITH clause', () => {
+    expect(createDatabaseSql(draft(), V[17])).toEqual(['CREATE DATABASE "analytics"'])
+  })
+
+  test('name is trimmed and quoted, with double quotes, spaces and mixed case kept', () => {
+    expect(createDatabaseSql(draft({ name: '  My "Shop"  ' }), V[17])).toEqual(['CREATE DATABASE "My ""Shop"""'])
+    expect(createDatabaseSql(draft({ name: 'Sales 2026' }), V[17])).toEqual(['CREATE DATABASE "Sales 2026"'])
+  })
+
+  test('blank optional text is the same as null', () => {
+    expect(createDatabaseSql(draft({ owner: '  ', tablespace: '', comment: ' ' }), V[17])).toEqual([
+      'CREATE DATABASE "analytics"',
+    ])
+  })
+
+  test('each option alone, with its own clause', () => {
+    expect(createDatabaseSql(draft({ owner: 'Ops Team' }), V[17])).toEqual([withOptions('OWNER = "Ops Team"')])
+    expect(createDatabaseSql(draft({ template: 'shop' }), V[17])).toEqual([withOptions('TEMPLATE = "shop"')])
+    expect(createDatabaseSql(draft({ template: 'template0', encoding: 'UTF8' }), V[17])).toEqual([
+      withOptions('TEMPLATE = "template0" ENCODING = \'UTF8\''),
+    ])
+    expect(createDatabaseSql(draft({ tablespace: 'fast space' }), V[17])).toEqual([
+      withOptions('TABLESPACE = "fast space"'),
+    ])
+    expect(createDatabaseSql(draft({ allowConnections: false }), V[17])).toEqual([
+      withOptions('ALLOW_CONNECTIONS = false'),
+    ])
+    expect(createDatabaseSql(draft({ connectionLimit: 10 }), V[17])).toEqual([withOptions('CONNECTION LIMIT = 10')])
+    expect(createDatabaseSql(draft({ connectionLimit: 0 }), V[17])).toEqual([withOptions('CONNECTION LIMIT = 0')])
+    expect(createDatabaseSql(draft({ isTemplate: true }), V[17])).toEqual([withOptions('IS_TEMPLATE = true')])
+  })
+
+  test('encoding and locale options with template0', () => {
+    const clean = { template: 'template0' }
+    expect(createDatabaseSql(draft({ ...clean, locale: 'C' }), V[17])).toEqual([
+      withOptions('TEMPLATE = "template0" LOCALE = \'C\''),
+    ])
+    expect(createDatabaseSql(draft({ ...clean, lcCollate: 'C', lcCtype: 'C.UTF-8' }), V[17])).toEqual([
+      withOptions("TEMPLATE = \"template0\" LC_COLLATE = 'C' LC_CTYPE = 'C.UTF-8'"),
+    ])
+    expect(createDatabaseSql(draft({ ...clean, collationVersion: '2.36' }), V[17])).toEqual([
+      withOptions('TEMPLATE = "template0" COLLATION_VERSION = \'2.36\''),
+    ])
+  })
+
+  test('ICU provider with its locale and rules (15 and 16 gates)', () => {
+    const icu = { template: 'template0', localeProvider: 'icu' as const, icuLocale: 'und-u-kn-true' }
+    expect(createDatabaseSql(draft(icu), V[15])).toEqual([
+      withOptions('TEMPLATE = "template0" ICU_LOCALE = \'und-u-kn-true\' LOCALE_PROVIDER = icu'),
+    ])
+    expect(createDatabaseSql(draft({ ...icu, icuRules: '&a<b' }), V[16])).toEqual([
+      withOptions("TEMPLATE = \"template0\" ICU_LOCALE = 'und-u-kn-true' ICU_RULES = '&a<b' LOCALE_PROVIDER = icu"),
+    ])
+    expect(createDatabaseSql(draft({ ...icu, icuRules: '&a<b' }), V[15])).toEqual([
+      withOptions('TEMPLATE = "template0" ICU_LOCALE = \'und-u-kn-true\' LOCALE_PROVIDER = icu'),
+    ])
+  })
+
+  test('builtin provider and its locale (17 and later)', () => {
+    const builtin = { template: 'template0', localeProvider: 'builtin' as const, builtinLocale: 'C.UTF-8' }
+    expect(createDatabaseSql(draft(builtin), V[17])).toEqual([
+      withOptions('TEMPLATE = "template0" BUILTIN_LOCALE = \'C.UTF-8\' LOCALE_PROVIDER = builtin'),
+    ])
+    expect(createDatabaseSql(draft({ ...builtin, builtinLocale: 'PG_UNICODE_FAST' }), V[18])).toEqual([
+      withOptions('TEMPLATE = "template0" BUILTIN_LOCALE = \'PG_UNICODE_FAST\' LOCALE_PROVIDER = builtin'),
+    ])
+  })
+
+  test('strategy and OID (15 and later)', () => {
+    expect(createDatabaseSql(draft({ strategy: 'file_copy', template: 'shop' }), V[15])).toEqual([
+      withOptions('TEMPLATE = "shop" STRATEGY = file_copy'),
+    ])
+    expect(createDatabaseSql(draft({ oid: 16384 }), V[15])).toEqual([withOptions('OID = 16384')])
+  })
+
+  test('the option order follows the CREATE DATABASE synopsis', () => {
+    const all = draft({
+      owner: 'app',
+      template: 'template0',
+      encoding: 'UTF8',
+      strategy: 'wal_log',
+      locale: 'C',
+      tablespace: 'fast',
+      allowConnections: false,
+      connectionLimit: 5,
+      isTemplate: true,
+      oid: 20000,
+    })
+    expect(createDatabaseSql(all, V[18])).toEqual([
+      withOptions(
+        `OWNER = "app" TEMPLATE = "template0" ENCODING = 'UTF8' STRATEGY = wal_log LOCALE = 'C' TABLESPACE = "fast" ALLOW_CONNECTIONS = false CONNECTION LIMIT = 5 IS_TEMPLATE = true OID = 20000`,
+      ),
+    ])
+  })
+
+  test('version gating: a 14 server drops STRATEGY, ICU and OID', () => {
+    const newer = draft({
+      template: 'template0',
+      strategy: 'wal_log',
+      localeProvider: 'icu',
+      icuLocale: 'und',
+      icuRules: '&a<b',
+      oid: 20000,
+    })
+    expect(createDatabaseSql(newer, V[14])).toEqual([withOptions('TEMPLATE = "template0"')])
+  })
+
+  test('version gating: a 16 server drops the builtin provider', () => {
+    const builtin = draft({ template: 'template0', localeProvider: 'builtin', builtinLocale: 'C' })
+    expect(createDatabaseSql(builtin, V[16])).toEqual([withOptions('TEMPLATE = "template0"')])
+    expect(createDatabaseSql(builtin, V[17])).toEqual([
+      withOptions('TEMPLATE = "template0" BUILTIN_LOCALE = \'C\' LOCALE_PROVIDER = builtin'),
+    ])
+  })
+
+  test('encoding and locale family is dropped unless the template is template0', () => {
+    const copy = draft({
+      template: 'shop',
+      encoding: 'UTF8',
+      localeProvider: 'libc',
+      locale: 'C',
+      lcCollate: 'C',
+      lcCtype: 'C',
+      collationVersion: '1',
+    })
+    expect(createDatabaseSql(copy, V[17])).toEqual([withOptions('TEMPLATE = "shop"')])
+    expect(createDatabaseSql(draft({ locale: 'C' }), V[17])).toEqual(['CREATE DATABASE "analytics"'])
+  })
+
+  test('the locale provider is dropped without template0, so its ICU locale is dropped too', () => {
+    expect(createDatabaseSql(draft({ localeProvider: 'icu' }), V[17])).toEqual(['CREATE DATABASE "analytics"'])
+  })
+
+  test('libc locales are not sent with the ICU provider', () => {
+    const icu = draft({
+      template: 'template0',
+      localeProvider: 'icu',
+      icuLocale: 'und',
+      locale: 'C',
+    })
+    expect(createDatabaseSql(icu, V[17])).toEqual([
+      withOptions('TEMPLATE = "template0" ICU_LOCALE = \'und\' LOCALE_PROVIDER = icu'),
+    ])
+  })
+
+  test('a comment and settings become their own statements after the create', () => {
+    expect(
+      createDatabaseSql(
+        draft({
+          comment: "Owner's shop",
+          settings: [
+            { name: 'work_mem', value: '64MB' },
+            { name: ' app.tenant ', value: "it's" },
+          ],
+        }),
+        V[17],
+      ),
+    ).toEqual([
+      'CREATE DATABASE "analytics"',
+      `COMMENT ON DATABASE "analytics" IS 'Owner''s shop'`,
+      `ALTER DATABASE "analytics" SET work_mem = '64MB'`,
+      `ALTER DATABASE "analytics" SET app.tenant = 'it''s'`,
+    ])
+  })
+
+  test('backslashes in values use an escape string', () => {
+    expect(createDatabaseSql(draft({ template: 'template0', locale: 'C:\\data' }), V[17])).toEqual([
+      withOptions('TEMPLATE = "template0" LOCALE = E\'C:\\\\data\''),
+    ])
+  })
+
+  test('problems: name, settings, limit and OID', () => {
+    expect(() => createDatabaseSql(draft({ name: '  ' }), V[17])).toThrow('CREATE DATABASE: Required')
+    expect(() => createDatabaseSql(draft({ name: 'x'.repeat(64) }), V[17])).toThrow('At most 63 bytes')
+    expect(() => createDatabaseSql(draft({ settings: [{ name: 'a-b', value: 'x' }] }), V[17])).toThrow(
+      'Setting "a-b": Use letters',
+    )
+    expect(() => createDatabaseSql(draft({ connectionLimit: -2 }), V[17])).toThrow('Connection limit must be')
+    expect(() => createDatabaseSql(draft({ connectionLimit: 1.5 }), V[17])).toThrow('Connection limit must be')
+    expect(() => createDatabaseSql(draft({ oid: 0 }), V[17])).toThrow('OID must be a whole number from 1')
+    expect(() => createDatabaseSql(draft({ oid: 4294967296 }), V[17])).toThrow('OID must be a whole number from 1')
+  })
+
+  test('createDatabaseProblem gives the first problem, or null', () => {
+    const options = { versionNum: V[17], takenNames: ['shop'] }
+    expect(createDatabaseProblem(draft({ name: 'shop' }), options)).toBe('Already used')
+    expect(createDatabaseProblem(draft({ name: '' }), options)).toBe('Required')
+    expect(createDatabaseProblem(draft(), options)).toBeNull()
+    expect(createDatabaseProblem(draft({ name: 'new_one' }), options)).toBeNull()
+  })
+
+  test('createDatabaseProblem: providers without their locale', () => {
+    const options = { versionNum: V[17], takenNames: [] }
+    const icu = { template: 'template0', localeProvider: 'icu' as const }
+    expect(createDatabaseProblem(draft(icu), options)).toBe('The ICU provider needs an ICU locale.')
+    const builtin = { template: 'template0', localeProvider: 'builtin' as const }
+    expect(createDatabaseProblem(draft(builtin), options)).toBe('The builtin provider needs a builtin locale.')
+  })
+
+  test('createDatabaseProblem: PG_UNICODE_FAST needs PostgreSQL 18', () => {
+    const fast = draft({ template: 'template0', localeProvider: 'builtin', builtinLocale: 'PG_UNICODE_FAST' })
+    expect(createDatabaseProblem(fast, { versionNum: V[17], takenNames: [] })).toBe(
+      'PG_UNICODE_FAST needs PostgreSQL 18 or newer.',
+    )
+    expect(createDatabaseProblem(fast, { versionNum: V[18], takenNames: [] })).toBeNull()
+  })
+
+  test('createDatabaseProblem agrees with the builder: options that are dropped are not problems', () => {
+    // Without template0 the provider is not sent, so a missing ICU locale does not block the create.
+    const dropped = draft({ localeProvider: 'icu' })
+    expect(createDatabaseProblem(dropped, { versionNum: V[17], takenNames: [] })).toBeNull()
+    expect(createDatabaseSql(dropped, V[17])).toEqual(['CREATE DATABASE "analytics"'])
+  })
+
+  test('createDatabaseProblem reports bad settings, limits and OIDs the same way the builder throws', () => {
+    const options = { versionNum: V[17], takenNames: [] }
+    expect(createDatabaseProblem(draft({ settings: [{ name: '1x', value: 'y' }] }), options)).toMatch(/^Setting "1x"/)
+    expect(createDatabaseProblem(draft({ connectionLimit: -1 }), options)).toMatch(/^Connection limit/)
+    expect(createDatabaseProblem(draft({ oid: 0 }), options)).toMatch(/^OID must/)
+  })
+})
+
+const roleDraft = (over: Partial<RoleDraft> = {}): RoleDraft => ({
+  name: 'app',
+  canLogin: true,
+  password: null,
+  superuser: false,
+  createDb: false,
+  createRole: false,
+  inherit: true,
+  replication: false,
+  bypassRls: false,
+  connectionLimit: null,
+  validUntil: null,
+  memberOf: [],
+  comment: null,
+  settings: [],
+  ...over,
+})
+
+const roleInfo = (over: Partial<RoleInfo> = {}): RoleInfo => ({
+  name: 'app',
+  canLogin: true,
+  superuser: false,
+  createDb: false,
+  createRole: false,
+  inherit: true,
+  replication: false,
+  bypassRls: false,
+  connectionLimit: null,
+  validUntil: null,
+  memberOf: [],
+  members: [],
+  comment: null,
+  sessions: 0,
+  settings: [],
+  isCurrentUser: false,
+  hasPassword: true,
+  ...over,
+})
+
+/** The draft that matches a role exactly: editing it changes nothing. */
+const asDraft = (r: RoleInfo): RoleDraft => ({
+  name: r.name,
+  canLogin: r.canLogin,
+  password: null,
+  superuser: r.superuser,
+  createDb: r.createDb,
+  createRole: r.createRole,
+  inherit: r.inherit,
+  replication: r.replication,
+  bypassRls: r.bypassRls,
+  connectionLimit: r.connectionLimit,
+  validUntil: r.validUntil,
+  memberOf: r.memberOf,
+  comment: r.comment,
+  settings: r.settings,
+})
+
+describe('roles', () => {
+  test('problems: names, password, settings, limit, expiry, membership', () => {
+    const ok = { taken: ['other'] }
+    expect(roleProblem(roleDraft(), ok)).toBeNull()
+    expect(roleProblem(roleDraft({ name: 'other' }), ok)).toBe('Already used')
+    expect(roleProblem(roleDraft({ name: 'pg_monitor' }), ok)).toBe('Names starting with pg_ are reserved.')
+    expect(roleProblem(roleDraft({ password: '' }), ok)).toBe('Enter a password or leave it unchanged.')
+    expect(roleProblem(roleDraft({ connectionLimit: -1 }), ok)).toContain('Connection limit must be')
+    expect(roleProblem(roleDraft({ validUntil: '31/12/2030' }), ok)).toContain('Expiry must be')
+    expect(roleProblem(roleDraft({ validUntil: '2030-12-31T23:59:00Z' }), ok)).toBeNull()
+    expect(roleProblem(roleDraft({ validUntil: '2030-12-31' }), ok)).toBeNull()
+    expect(roleProblem(roleDraft({ memberOf: ['app'] }), ok)).toBe('A role cannot be a member of itself.')
+    expect(roleProblem(roleDraft({ settings: [{ name: '1x', value: 'v' }] }), ok)).toContain('Setting "1x"')
+  })
+
+  test('create: only non-default attributes, LOGIN or NOLOGIN always', () => {
+    expect(createRoleSql(roleDraft(), null)).toEqual(['CREATE ROLE "app" WITH LOGIN'])
+    expect(createRoleSql(roleDraft({ canLogin: false }), null)).toEqual(['CREATE ROLE "app" WITH NOLOGIN'])
+    expect(createRoleSql(roleDraft({ inherit: false, createDb: true }), null)).toEqual([
+      'CREATE ROLE "app" WITH LOGIN CREATEDB NOINHERIT',
+    ])
+  })
+
+  test('create: clauses, memberships, comment, settings and the password', () => {
+    const sql = createRoleSql(
+      roleDraft({
+        canLogin: false,
+        superuser: true,
+        connectionLimit: 5,
+        validUntil: '2030-01-01',
+        memberOf: ['readers', 'writers'],
+        comment: "App's role",
+        settings: [{ name: 'work_mem', value: '64MB' }],
+      }),
+      PASSWORD_MASK,
+    )
+    expect(sql).toEqual([
+      `CREATE ROLE "app" WITH NOLOGIN SUPERUSER CONNECTION LIMIT 5 VALID UNTIL '2030-01-01' PASSWORD '********'`,
+      'GRANT "readers" TO "app"',
+      'GRANT "writers" TO "app"',
+      `COMMENT ON ROLE "app" IS 'App''s role'`,
+      `ALTER ROLE "app" SET work_mem = '64MB'`,
+    ])
+  })
+
+  test('create throws on a problem', () => {
+    expect(() => createRoleSql(roleDraft({ name: 'pg_x' }), null)).toThrow(
+      'CREATE ROLE: Names starting with pg_ are reserved.',
+    )
+  })
+
+  test('alter: nothing changed means no statements', () => {
+    const before = roleInfo({ memberOf: ['readers'], comment: 'old', settings: [{ name: 'work_mem', value: '1MB' }] })
+    expect(alterRoleSql(before, asDraft(before), null)).toEqual([])
+  })
+
+  test('alter: only changes, in order, rename last', () => {
+    const before = roleInfo({
+      memberOf: ['readers'],
+      comment: 'old',
+      settings: [
+        { name: 'work_mem', value: '64MB' },
+        { name: 'search_path', value: 'x' },
+      ],
+    })
+    const after = roleDraft({
+      name: 'service',
+      canLogin: false,
+      superuser: true,
+      connectionLimit: 10,
+      validUntil: '2031-06-01',
+      memberOf: ['writers'],
+      comment: null,
+      settings: [{ name: 'work_mem', value: '128MB' }],
+    })
+    expect(alterRoleSql(before, after, "'SCRAM-SHA-256$x'")).toEqual([
+      `ALTER ROLE "app" WITH NOLOGIN SUPERUSER CONNECTION LIMIT 10 VALID UNTIL '2031-06-01'`,
+      `ALTER ROLE "app" WITH PASSWORD 'SCRAM-SHA-256$x'`,
+      'GRANT "writers" TO "app"',
+      'REVOKE "readers" FROM "app"',
+      'COMMENT ON ROLE "app" IS NULL',
+      `ALTER ROLE "app" SET work_mem = '128MB'`,
+      'ALTER ROLE "app" RESET search_path',
+      'ALTER ROLE "app" RENAME TO "service"',
+    ])
+  })
+
+  test('alter: clearing a limit or an expiry uses -1 and infinity', () => {
+    const before = roleInfo({ connectionLimit: 10, validUntil: '2031-06-01T00:00:00.000000Z' })
+    expect(alterRoleSql(before, asDraft(before), null)).toEqual([])
+    const cleared = { ...asDraft(before), connectionLimit: null, validUntil: null }
+    expect(alterRoleSql(before, cleared, null)).toEqual([
+      `ALTER ROLE "app" WITH CONNECTION LIMIT -1 VALID UNTIL 'infinity'`,
+    ])
+  })
+
+  test('alter: a flag that turns back off is written with its NO keyword', () => {
+    const before = roleInfo({ inherit: false, bypassRls: true })
+    expect(alterRoleSql(before, asDraft(before), null)).toEqual([])
+    expect(alterRoleSql(before, { ...asDraft(before), inherit: true, bypassRls: false }, null)).toEqual([
+      'ALTER ROLE "app" WITH INHERIT NOBYPASSRLS',
+    ])
+  })
+
+  test('drop: optional reassignment and privilege removal, then DROP ROLE', () => {
+    expect(dropRoleSql('app', null, false)).toEqual(['DROP ROLE "app"'])
+    expect(dropRoleSql('app', 'service', true)).toEqual([
+      'REASSIGN OWNED BY "app" TO "service"',
+      'DROP OWNED BY "app"',
+      'DROP ROLE "app"',
+    ])
+  })
+})
+
+describe('schemaAccessLevel', () => {
+  const counts = (over: Partial<SchemaAccessCounts> = {}): SchemaAccessCounts => ({
+    usage: true,
+    tables: 3,
+    canRead: 3,
+    canWrite: 0,
+    anyWrite: 0,
+    futureRead: true,
+    futureWrite: false,
+    futureAnyWrite: false,
+    ...over,
+  })
+
+  test('none: no usage, no table privileges and no default privileges that write', () => {
+    const bare = {
+      usage: false,
+      canRead: 0,
+      canWrite: 0,
+      anyWrite: 0,
+      futureRead: false,
+      futureWrite: false,
+      futureAnyWrite: false,
+    }
+    expect(schemaAccessLevel({ ...bare, tables: 3 })).toBe('none')
+    expect(schemaAccessLevel({ ...bare, tables: 0 })).toBe('none')
+  })
+
+  test('none is refused by any one grant', () => {
+    const bare = {
+      usage: false,
+      canRead: 0,
+      canWrite: 0,
+      anyWrite: 0,
+      futureRead: false,
+      futureWrite: false,
+      futureAnyWrite: false,
+    }
+    expect(schemaAccessLevel({ ...bare, tables: 3, usage: true })).toBe('custom')
+    expect(schemaAccessLevel({ ...bare, tables: 3, canRead: 1 })).toBe('custom')
+    expect(schemaAccessLevel({ ...bare, tables: 3, canWrite: 1, anyWrite: 1 })).toBe('custom')
+    expect(schemaAccessLevel({ ...bare, tables: 3, anyWrite: 1 })).toBe('custom')
+    expect(schemaAccessLevel({ ...bare, tables: 3, futureRead: true })).toBe('custom')
+    expect(schemaAccessLevel({ ...bare, tables: 3, futureWrite: true, futureAnyWrite: true })).toBe('custom')
+    expect(schemaAccessLevel({ ...bare, tables: 3, futureAnyWrite: true })).toBe('custom')
+  })
+
+  test('read: usage, SELECT on every table, default SELECT only', () => {
+    expect(schemaAccessLevel(counts())).toBe('read')
+  })
+
+  test('read is refused by a missing usage, a partial read, any table write or a write default', () => {
+    expect(schemaAccessLevel(counts({ usage: false }))).toBe('custom')
+    expect(schemaAccessLevel(counts({ canRead: 2 }))).toBe('custom')
+    expect(schemaAccessLevel(counts({ futureWrite: true, futureAnyWrite: true }))).toBe('custom')
+    expect(schemaAccessLevel(counts({ futureRead: false }))).toBe('custom')
+  })
+
+  test('write: usage, all four privileges on every table, default grants for all four', () => {
+    expect(schemaAccessLevel(counts({ canWrite: 3, anyWrite: 3, futureWrite: true, futureAnyWrite: true }))).toBe(
+      'write',
+    )
+  })
+
+  test('write may carry an extra TRUNCATE', () => {
+    expect(
+      schemaAccessLevel(
+        counts({ canWrite: 3, anyWrite: 3, futureWrite: true, futureAnyWrite: true, futureRead: false }),
+      ),
+    ).toBe('write')
+  })
+
+  test('write is refused by a partial write, a partial read or a missing default', () => {
+    expect(
+      schemaAccessLevel(counts({ canRead: 3, canWrite: 2, anyWrite: 3, futureWrite: true, futureAnyWrite: true })),
+    ).toBe('custom')
+    expect(
+      schemaAccessLevel(counts({ canRead: 2, canWrite: 3, anyWrite: 3, futureWrite: true, futureAnyWrite: true })),
+    ).toBe('custom')
+    expect(schemaAccessLevel(counts({ canWrite: 3, anyWrite: 3, futureWrite: false, futureAnyWrite: true }))).toBe(
+      'custom',
+    )
+    expect(
+      schemaAccessLevel(counts({ usage: false, canWrite: 3, anyWrite: 3, futureWrite: true, futureAnyWrite: true })),
+    ).toBe('custom')
+  })
+
+  test('SELECT on all tables and INSERT on all tables is custom, not read', () => {
+    expect(schemaAccessLevel(counts({ canWrite: 0, anyWrite: 3 }))).toBe('custom')
+  })
+
+  test('TRUNCATE only on every table is custom, not none', () => {
+    const truncateOnly = counts({ canRead: 0, canWrite: 0, anyWrite: 3, futureRead: false })
+    expect(schemaAccessLevel(truncateOnly)).toBe('custom')
+    expect(schemaAccessLevel({ ...truncateOnly, usage: false })).toBe('custom')
+  })
+
+  test('SELECT on all tables and TRUNCATE on one is custom, not read', () => {
+    expect(schemaAccessLevel(counts({ anyWrite: 1 }))).toBe('custom')
+  })
+
+  test('an empty schema is decided by usage and the default privileges only', () => {
+    const empty = counts({ tables: 0, canRead: 0, canWrite: 0 })
+    expect(schemaAccessLevel({ ...empty, futureRead: true })).toBe('read')
+    expect(schemaAccessLevel({ ...empty, futureRead: true, futureWrite: true, futureAnyWrite: true })).toBe('write')
+    expect(schemaAccessLevel({ ...empty, futureRead: false })).toBe('custom')
+    expect(schemaAccessLevel({ ...empty, usage: false, futureRead: true })).toBe('custom')
+    expect(schemaAccessLevel({ ...empty, usage: false, futureWrite: true, futureAnyWrite: true })).toBe('custom')
+    expect(schemaAccessLevel({ ...empty, futureRead: false, futureAnyWrite: true })).toBe('custom')
+  })
+})
+
+const rolePriv = (over: Partial<RolePrivileges> = {}): RolePrivileges => ({
+  role: 'app',
+  superuser: false,
+  currentUser: 'powview',
+  databases: [
+    { name: 'shop', connect: false, create: false, temporary: false, publicConnect: true, publicTemporary: true },
+  ],
+  schemas: [
+    {
+      name: 'public',
+      level: 'none',
+      usage: false,
+      tables: 3,
+      canRead: 0,
+      canWrite: 0,
+      anyWrite: 0,
+      futureRead: false,
+      futureWrite: false,
+      futureAnyWrite: false,
+    },
+  ],
+  ...over,
+})
+
+const privDraft = (over: Partial<RolePrivilegesDraft> = {}): RolePrivilegesDraft => ({
+  databases: [],
+  schemas: [],
+  ...over,
+})
+
+const READ_SQL = [
+  'GRANT USAGE ON SCHEMA "public" TO "app"',
+  'REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA "public" FROM "app"',
+  'GRANT SELECT ON ALL TABLES IN SCHEMA "public" TO "app"',
+  'GRANT SELECT ON ALL SEQUENCES IN SCHEMA "public" TO "app"',
+  'ALTER DEFAULT PRIVILEGES IN SCHEMA "public" REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLES FROM "app"',
+  'ALTER DEFAULT PRIVILEGES IN SCHEMA "public" GRANT SELECT ON TABLES TO "app"',
+  'ALTER DEFAULT PRIVILEGES IN SCHEMA "public" GRANT SELECT ON SEQUENCES TO "app"',
+]
+
+const WRITE_SQL = [
+  'GRANT USAGE ON SCHEMA "public" TO "app"',
+  'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "public" TO "app"',
+  'GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA "public" TO "app"',
+  'ALTER DEFAULT PRIVILEGES IN SCHEMA "public" GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "app"',
+  'ALTER DEFAULT PRIVILEGES IN SCHEMA "public" GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO "app"',
+]
+
+const NONE_SQL = [
+  'REVOKE ALL ON ALL TABLES IN SCHEMA "public" FROM "app"',
+  'REVOKE ALL ON ALL SEQUENCES IN SCHEMA "public" FROM "app"',
+  'REVOKE ALL ON SCHEMA "public" FROM "app"',
+  'ALTER DEFAULT PRIVILEGES IN SCHEMA "public" REVOKE ALL ON TABLES FROM "app"',
+  'ALTER DEFAULT PRIVILEGES IN SCHEMA "public" REVOKE ALL ON SEQUENCES FROM "app"',
+]
+
+describe('rolePrivilegesSql', () => {
+  test('database switches: grant and revoke, one statement per database and direction', () => {
+    const current = rolePriv()
+    expect(
+      rolePrivilegesSql(
+        current,
+        privDraft({ databases: [{ name: 'shop', connect: true, create: false, temporary: false }] }),
+      ),
+    ).toEqual(['GRANT CONNECT ON DATABASE "shop" TO "app"'])
+    expect(
+      rolePrivilegesSql(
+        rolePriv({ databases: [{ ...current.databases[0], connect: true, create: true }] }),
+        privDraft({ databases: [{ name: 'shop', connect: false, create: false, temporary: false }] }),
+      ),
+    ).toEqual(['REVOKE CONNECT, CREATE ON DATABASE "shop" FROM "app"'])
+  })
+
+  test('database switches: a grant and a revoke for the same database are two statements', () => {
+    const current = rolePriv({ databases: [{ ...rolePriv().databases[0], temporary: true }] })
+    expect(
+      rolePrivilegesSql(
+        current,
+        privDraft({ databases: [{ name: 'shop', connect: true, create: true, temporary: false }] }),
+      ),
+    ).toEqual(['GRANT CONNECT, CREATE ON DATABASE "shop" TO "app"', 'REVOKE TEMPORARY ON DATABASE "shop" FROM "app"'])
+  })
+
+  test('no-op: the draft matches the current state', () => {
+    expect(rolePrivilegesSql(rolePriv(), privDraft())).toEqual([])
+    expect(
+      rolePrivilegesSql(
+        rolePriv(),
+        privDraft({ databases: [{ name: 'shop', connect: false, create: false, temporary: false }] }),
+      ),
+    ).toEqual([])
+    expect(rolePrivilegesSql(rolePriv(), privDraft({ schemas: [{ name: 'public', level: 'none' }] }))).toEqual([])
+  })
+
+  test('quoting: odd names are quoted, and the role name too', () => {
+    const current = rolePriv({
+      role: 'Ann\'s "role"',
+      databases: [
+        {
+          name: 'my "odd" db',
+          connect: false,
+          create: false,
+          temporary: false,
+          publicConnect: true,
+          publicTemporary: true,
+        },
+      ],
+      schemas: [{ ...rolePriv().schemas[0], name: 'weird name' }],
+    })
+    expect(
+      rolePrivilegesSql(
+        current,
+        privDraft({ databases: [{ name: 'my "odd" db', connect: true, create: false, temporary: false }] }),
+      ),
+    ).toEqual(['GRANT CONNECT ON DATABASE "my ""odd"" db" TO "Ann\'s ""role"""'])
+    expect(rolePrivilegesSql(current, privDraft({ schemas: [{ name: 'weird name', level: 'read' }] }))[0]).toBe(
+      'GRANT USAGE ON SCHEMA "weird name" TO "Ann\'s ""role"""',
+    )
+  })
+
+  test('a database or schema that is not in the current state throws', () => {
+    expect(() =>
+      rolePrivilegesSql(
+        rolePriv(),
+        privDraft({ databases: [{ name: 'other', connect: true, create: false, temporary: false }] }),
+      ),
+    ).toThrow('Database "other" was not found.')
+    expect(() => rolePrivilegesSql(rolePriv(), privDraft({ schemas: [{ name: 'nope', level: 'read' }] }))).toThrow(
+      'Schema "nope" was not found.',
+    )
+  })
+
+  test('schema levels: none to read and to write, with the exact statements', () => {
+    expect(rolePrivilegesSql(rolePriv(), privDraft({ schemas: [{ name: 'public', level: 'read' }] }))).toEqual(READ_SQL)
+    expect(rolePrivilegesSql(rolePriv(), privDraft({ schemas: [{ name: 'public', level: 'write' }] }))).toEqual(
+      WRITE_SQL,
+    )
+  })
+
+  test('schema levels: each level to each other level, and the same level is a no-op', () => {
+    const at = (level: RolePrivileges['schemas'][number]['level']) =>
+      rolePriv({ schemas: [{ ...rolePriv().schemas[0], level }] })
+    const expected = { none: NONE_SQL, read: READ_SQL, write: WRITE_SQL, custom: [] as string[] }
+    const levels = ['none', 'read', 'write'] as const
+    for (const from of [...levels, 'custom'] as const) {
+      for (const to of levels) {
+        const sql = rolePrivilegesSql(at(from), privDraft({ schemas: [{ name: 'public', level: to }] }))
+        if (from === to) expect(sql).toEqual([])
+        else expect(sql).toEqual(expected[to])
+      }
+    }
+  })
+
+  test('a custom schema can be set to any level', () => {
+    const custom = rolePriv({ schemas: [{ ...rolePriv().schemas[0], level: 'custom' }] })
+    expect(rolePrivilegesSql(custom, privDraft({ schemas: [{ name: 'public', level: 'none' }] }))).toEqual(NONE_SQL)
+  })
+
+  test('schemas left out of the draft are not touched; databases run before schemas', () => {
+    const current = rolePriv({
+      schemas: [
+        { ...rolePriv().schemas[0], name: 'a' },
+        { ...rolePriv().schemas[0], name: 'b' },
+      ],
+    })
+    const sql = rolePrivilegesSql(
+      current,
+      privDraft({
+        schemas: [{ name: 'b', level: 'read' }],
+        databases: [{ name: 'shop', connect: true, create: false, temporary: false }],
+      }),
+    )
+    expect(sql[0]).toBe('GRANT CONNECT ON DATABASE "shop" TO "app"')
+    expect(sql.slice(1)).toEqual(READ_SQL.map((s) => s.replace('"public"', '"b"')))
   })
 })

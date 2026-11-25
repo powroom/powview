@@ -22,6 +22,7 @@ import {
   SearchIcon,
   SquareFunctionIcon,
   SquareTerminalIcon,
+  UsersIcon,
   TableIcon,
   TablePropertiesIcon,
   Trash2Icon,
@@ -87,6 +88,7 @@ import { useHotkey } from '@/hooks/use-hotkey'
 import { useRetained } from '@/hooks/use-retained'
 import { useSelectedSchema } from '@/hooks/use-selected-schema'
 import { copyWithToast } from '@/components/app/copy-feedback'
+import { createDatabaseBlock } from '@/lib/databases'
 import { formatBytes, formatCount, relationKindLabel } from '@/lib/format'
 import { useExportDatabaseDialog } from '@/lib/export-database-dialog'
 import { useRestoreDatabaseDialog } from '@/lib/restore-database-dialog'
@@ -133,7 +135,6 @@ export function WorkspaceSidebar({
   const [definition, setDefinition] = useState<DefinitionTarget | null>(null)
   const [relationAction, setRelationAction] = useState<RelationAction | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
-  const [databaseMenuOpen, setDatabaseMenuOpen] = useState(false)
   const [createDbMounted, setCreateDbMounted] = useState(false)
   const [createDbOpen, setCreateDbOpen] = useState(false)
   const filterRef = useRef<HTMLInputElement>(null)
@@ -219,14 +220,9 @@ export function WorkspaceSidebar({
   const databaseList = databases ?? [{ name: database, size: null }]
   const databaseNames = databaseList.map((d) => d.name)
   // why "New database" cannot be used now, or null
-  const createDbBlocked = connection.readOnly
-    ? 'This connection is read-only'
-    : server?.canCreateDatabase === false
-      ? 'Your database user cannot create databases'
-      : null
+  const createDbBlocked = createDatabaseBlock(connection, server)
   const openCreateDatabase = () => {
     closeSheet()
-    setDatabaseMenuOpen(false)
     setCreateDbMounted(true)
     setCreateDbOpen(true)
   }
@@ -352,102 +348,123 @@ export function WorkspaceSidebar({
               </Menu>
             </SidebarMenuItem>
           </SidebarMenu>
-
-          <Combobox
-            autoHighlight
-            items={databaseNames}
-            onOpenChange={setDatabaseMenuOpen}
-            onValueChange={(v) => {
-              if (v && v !== database) {
-                void navigate({ to: '/c/$connId/$db', params: { connId: connectionId, db: v } })
-              }
-            }}
-            open={databaseMenuOpen}
-            value={database}
-          >
-            <ComboboxTrigger
-              ref={databaseTriggerRef}
-              render={<SelectButton aria-label="Database" className="bg-background" size="sm" />}
-            >
-              <span className="flex min-w-0 flex-1 items-center gap-2">
-                <DatabaseIcon aria-hidden="true" className="size-3.5 opacity-60" />
-                <span className="truncate">
-                  <ComboboxValue />
-                </span>
-              </span>
-            </ComboboxTrigger>
-            <ComboboxPopup anchor={databaseTriggerRef} aria-label="Databases">
-              <div className="border-b p-2">
-                <ComboboxInput
-                  className="rounded-md before:rounded-[calc(var(--radius-md)-1px)]"
-                  placeholder="Search databases…"
-                  showTrigger={false}
-                  startAddon={<SearchIcon />}
-                />
-              </div>
-              <ComboboxEmpty>No databases found.</ComboboxEmpty>
-              <ComboboxList>
-                {(name: string) => {
-                  const size = databaseList.find((d) => d.name === name)?.size
-                  return (
-                    <ComboboxItem key={name} value={name}>
-                      <span className="flex w-full items-center justify-between gap-4">
-                        <span className="truncate">{name}</span>
-                        {size != null && (
-                          <span className="text-muted-foreground text-xs tabular-nums">{formatBytes(size)}</span>
-                        )}
-                      </span>
-                    </ComboboxItem>
-                  )
-                }}
-              </ComboboxList>
-              <div className="border-t p-1">
-                <Tooltip>
-                  <TooltipTrigger
-                    render={
-                      // a disabled button gets no pointer events: the wrapper shows why
-                      <span className="flex" />
-                    }
-                  >
-                    <Button
-                      className="w-full justify-start"
-                      disabled={Boolean(createDbBlocked)}
-                      onClick={openCreateDatabase}
-                      size="sm"
-                      variant="ghost"
-                    >
-                      <PlusIcon aria-hidden="true" />
-                      New database
-                    </Button>
-                  </TooltipTrigger>
-                  {createDbBlocked && <TooltipPopup>{createDbBlocked}</TooltipPopup>}
-                </Tooltip>
-              </div>
-            </ComboboxPopup>
-          </Combobox>
         </SidebarHeader>
 
         <SidebarGroup className="pb-0">
-          <SidebarMenu className="gap-0.5">
-            <NavItem
-              icon={LayoutGridIcon}
-              label="Overview"
-              to="/c/$connId/$db"
-              params={{ connId: connectionId, db: database }}
-            />
-            <NavItem
-              icon={NetworkIcon}
-              label="Diagram"
-              to="/c/$connId/$db/diagram"
-              params={{ connId: connectionId, db: database }}
-            />
-            <NavItem
-              icon={SquareTerminalIcon}
-              label="SQL editor"
-              to="/c/$connId/$db/sql"
-              params={{ connId: connectionId, db: database }}
-            />
-          </SidebarMenu>
+          <SidebarGroupLabel className={GROUP_LABEL}>Server</SidebarGroupLabel>
+          <SidebarGroupContent>
+            <SidebarMenu className="gap-0.5">
+              <NavItem
+                icon={DatabaseIcon}
+                label="Databases"
+                to="/c/$connId/$db/databases"
+                params={{ connId: connectionId, db: database }}
+              />
+              <NavItem
+                icon={UsersIcon}
+                label="Roles"
+                to="/c/$connId/$db/roles"
+                params={{ connId: connectionId, db: database }}
+              />
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+
+        <SidebarGroup className="pb-0">
+          <SidebarGroupLabel className={GROUP_LABEL}>Database</SidebarGroupLabel>
+          <SidebarGroupContent>
+            {/* the database picker belongs to this group: everything below it is about that database */}
+            <div className="pb-1.5">
+              <Combobox
+                autoHighlight
+                items={databaseNames}
+                onValueChange={(v) => {
+                  if (v && v !== database) {
+                    void navigate({ to: '/c/$connId/$db', params: { connId: connectionId, db: v } })
+                  }
+                }}
+                value={database}
+              >
+                {/* the same shape as the schema picker below: the list, then its + button */}
+                <ButtonGroup className="w-full">
+                  <ComboboxTrigger
+                    ref={databaseTriggerRef}
+                    render={<SelectButton aria-label="Database" className="min-w-0 flex-1 bg-background" size="sm" />}
+                  >
+                    <span className="flex min-w-0 flex-1 items-center gap-2">
+                      <DatabaseIcon aria-hidden="true" className="size-3.5 opacity-60" />
+                      <span className="truncate">
+                        <ComboboxValue />
+                      </span>
+                    </span>
+                  </ComboboxTrigger>
+                  {!createDbBlocked && (
+                    <Tooltip>
+                      <TooltipTrigger
+                        render={
+                          <Button
+                            aria-label="New database"
+                            onClick={openCreateDatabase}
+                            size="icon-sm"
+                            variant="outline"
+                          />
+                        }
+                      >
+                        <PlusIcon aria-hidden="true" className="size-3.5" />
+                      </TooltipTrigger>
+                      <TooltipPopup>New database</TooltipPopup>
+                    </Tooltip>
+                  )}
+                </ButtonGroup>
+                <ComboboxPopup anchor={databaseTriggerRef} aria-label="Databases">
+                  <div className="border-b p-2">
+                    <ComboboxInput
+                      className="rounded-md before:rounded-[calc(var(--radius-md)-1px)]"
+                      placeholder="Search databases…"
+                      showTrigger={false}
+                      startAddon={<SearchIcon />}
+                    />
+                  </div>
+                  <ComboboxEmpty>No databases found.</ComboboxEmpty>
+                  <ComboboxList>
+                    {(name: string) => {
+                      const size = databaseList.find((d) => d.name === name)?.size
+                      return (
+                        <ComboboxItem key={name} value={name}>
+                          <span className="flex w-full items-center justify-between gap-4">
+                            <span className="truncate">{name}</span>
+                            {size != null && (
+                              <span className="text-muted-foreground text-xs tabular-nums">{formatBytes(size)}</span>
+                            )}
+                          </span>
+                        </ComboboxItem>
+                      )
+                    }}
+                  </ComboboxList>
+                </ComboboxPopup>
+              </Combobox>
+            </div>
+            <SidebarMenu className="gap-0.5">
+              <NavItem
+                icon={LayoutGridIcon}
+                label="Overview"
+                to="/c/$connId/$db"
+                params={{ connId: connectionId, db: database }}
+              />
+              <NavItem
+                icon={NetworkIcon}
+                label="Diagram"
+                to="/c/$connId/$db/diagram"
+                params={{ connId: connectionId, db: database }}
+              />
+              <NavItem
+                icon={SquareTerminalIcon}
+                label="SQL editor"
+                to="/c/$connId/$db/sql"
+                params={{ connId: connectionId, db: database }}
+              />
+            </SidebarMenu>
+          </SidebarGroupContent>
         </SidebarGroup>
 
         <div className="flex flex-col gap-2 px-2 pt-3 pb-1">
@@ -679,17 +696,25 @@ export function WorkspaceSidebar({
 
         <SidebarFooter className="border-sidebar-border border-t py-2">
           <div className="grid grid-cols-2 gap-1.5 px-2 pb-2">
-            <Button
-              onClick={() => {
-                closeSheet()
-                setExportOpen(true)
-              }}
-              size="sm"
-              variant="outline"
-            >
-              <DownloadIcon aria-hidden="true" />
-              Backup
-            </Button>
+            {/* both act on the database picked above, so the tooltips name it */}
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    onClick={() => {
+                      closeSheet()
+                      setExportOpen(true)
+                    }}
+                    size="sm"
+                    variant="outline"
+                  />
+                }
+              >
+                <DownloadIcon aria-hidden="true" />
+                Backup
+              </TooltipTrigger>
+              <TooltipPopup>Back up {database}</TooltipPopup>
+            </Tooltip>
             <Tooltip>
               <TooltipTrigger
                 render={
@@ -711,7 +736,9 @@ export function WorkspaceSidebar({
                   Restore
                 </Button>
               </TooltipTrigger>
-              {connection.readOnly && <TooltipPopup>This connection is read-only.</TooltipPopup>}
+              <TooltipPopup>
+                {connection.readOnly ? 'This connection is read-only.' : `Restore a backup into ${database}`}
+              </TooltipPopup>
             </Tooltip>
           </div>
           <div className="flex items-center gap-2 px-2 text-xs">
@@ -790,7 +817,12 @@ function NavItem({
 }: {
   icon: LucideIcon
   label: string
-  to: '/c/$connId/$db' | '/c/$connId/$db/diagram' | '/c/$connId/$db/sql'
+  to:
+    | '/c/$connId/$db'
+    | '/c/$connId/$db/diagram'
+    | '/c/$connId/$db/sql'
+    | '/c/$connId/$db/databases'
+    | '/c/$connId/$db/roles'
   params: { connId: string; db: string }
 }) {
   const matchRoute = useMatchRoute()
@@ -808,12 +840,16 @@ function NavItem({
 // name bar widths for the loading list; the rows themselves keep the real height
 const SKELETON_ITEM_WIDTHS = ['w-3/5', 'w-1/2', 'w-2/3', 'w-2/5', 'w-3/4', 'w-1/2', 'w-1/3', 'w-3/5']
 
+/** The small uppercase label over a group of sidebar rows. */
+const GROUP_LABEL =
+  'h-7 w-full gap-1 font-medium text-[0.7rem] text-sidebar-foreground/80 uppercase tracking-wider [&>svg]:size-3.5'
+
 function GroupHeader({ id, label, count, open }: { id: string; label: string; count: number; open: boolean }) {
   const setCollapsed = useAppStore((s) => s.setGroupCollapsed)
   return (
     <SidebarGroupLabel
       aria-expanded={open}
-      className="h-7 w-full cursor-pointer gap-1 font-medium text-[0.7rem] text-sidebar-foreground/80 uppercase tracking-wider hover:text-sidebar-accent-foreground [&>svg]:size-3.5"
+      className={`${GROUP_LABEL} cursor-pointer hover:text-sidebar-accent-foreground`}
       onClick={() => setCollapsed(id, open)}
       render={<button type="button" />}
     >

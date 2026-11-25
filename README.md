@@ -54,6 +54,8 @@ Click **Add connection**, then paste a connection URL, such as `postgresql://use
 
 - See columns, types, constraints, indexes, triggers, and links between tables, with a diagram of how they connect.
 - Create databases, schemas, and tables, and change columns, indexes, constraints, and tables with forms. Each form shows the SQL it will run.
+- Manage databases on one page: rename, change the owner, set a connection limit, or delete.
+- Manage roles: users and groups, their passwords and permissions, and what each role can read or write in a database.
 
 **SQL editor**
 
