@@ -245,6 +245,11 @@ export function createSchemaSql(name: string, comment = ''): string[] {
   return out
 }
 
+/** CREATE DATABASE with the server defaults (owner, encoding, template). One statement, so it runs outside a transaction. */
+export function createDatabaseSql(name: string): string[] {
+  return [`CREATE DATABASE ${quoteIdent(name.trim())}`]
+}
+
 /** Why a schema name cannot be used, or null. PostgreSQL reserves names that start with pg_. */
 export function schemaNameProblem(name: string, taken: readonly string[] = []): string | null {
   const problem = nameProblem(name, taken)

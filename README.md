@@ -53,7 +53,7 @@ Click **Add connection**, then paste a connection URL, such as `postgresql://use
 **Structure**
 
 - See columns, types, constraints, indexes, triggers, and links between tables, with a diagram of how they connect.
-- Change columns, indexes, constraints, and tables with forms. Each form shows the SQL it will run.
+- Create databases, schemas, and tables, and change columns, indexes, constraints, and tables with forms. Each form shows the SQL it will run.
 
 **SQL editor**
 

@@ -34,6 +34,7 @@ export async function getServerInfo(connectionId: string, database?: string): Pr
     started_at: string
     size: string
     is_superuser: boolean
+    can_create_db: boolean
     read_only: string
   }>(
     connectionId,
@@ -47,6 +48,7 @@ export async function getServerInfo(connectionId: string, database?: string): Pr
             pg_postmaster_start_time()::text AS started_at,
             pg_database_size(current_database()) AS size,
             coalesce((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false) AS is_superuser,
+            coalesce((SELECT rolsuper OR rolcreatedb FROM pg_roles WHERE rolname = current_user), false) AS can_create_db,
             current_setting('default_transaction_read_only') AS read_only
        FROM pg_database d WHERE d.datname = current_database()`,
   )
@@ -61,6 +63,7 @@ export async function getServerInfo(connectionId: string, database?: string): Pr
     startedAt: row.started_at,
     databaseSize: num(row.size),
     isSuperuser: row.is_superuser,
+    canCreateDatabase: row.can_create_db,
     readOnly: row.read_only === 'on',
   }
 }

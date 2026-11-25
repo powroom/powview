@@ -168,6 +168,8 @@ export interface ServerInfo {
   startedAt: string
   databaseSize: number
   isSuperuser: boolean
+  /** superuser or CREATEDB: the role may run CREATE DATABASE */
+  canCreateDatabase: boolean
   readOnly: boolean
 }
 

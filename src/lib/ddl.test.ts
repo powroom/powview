@@ -3,6 +3,7 @@ import {
   addColumnSql,
   addConstraintSql,
   alterColumnSql,
+  createDatabaseSql,
   createIndexSql,
   createSchemaSql,
   createTableSql,
@@ -139,6 +140,15 @@ describe('schemas', () => {
 
   test('a blank comment gives one statement', () => {
     expect(createSchemaSql('billing', '   ')).toEqual(['CREATE SCHEMA "billing"'])
+  })
+
+  test('createDatabaseSql: a plain name', () => {
+    expect(createDatabaseSql('analytics')).toEqual(['CREATE DATABASE "analytics"'])
+  })
+
+  test('createDatabaseSql: trimmed and quoted, with double quotes, spaces and mixed case kept', () => {
+    expect(createDatabaseSql('  My "Shop"  ')).toEqual(['CREATE DATABASE "My ""Shop"""'])
+    expect(createDatabaseSql('Sales 2026')).toEqual(['CREATE DATABASE "Sales 2026"'])
   })
 
   test('schemaNameProblem: empty, taken, pg_ prefix, valid', () => {

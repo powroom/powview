@@ -72,7 +72,7 @@ interface DdlTarget {
 // running a script
 // ---------------------------------------------------------------------------
 
-function useApplyDdl(target: DdlTarget) {
+function useApplyDdl(target: Pick<DdlTarget, 'connectionId' | 'database'>) {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: async (sql: string) => {
@@ -110,7 +110,7 @@ function useTypeOptions(target: DdlTarget) {
 // dialog shell
 // ---------------------------------------------------------------------------
 
-function DdlDialog({
+export function DdlDialog({
   open,
   onOpenChange,
   title,
@@ -134,7 +134,8 @@ function DdlDialog({
   /** why it cannot be applied yet (shown on the button's tooltip) */
   problem?: string | null
   applyLabel: string
-  target: DdlTarget
+  /** the connection and database the statements run on; the schema is not needed here */
+  target: Pick<DdlTarget, 'connectionId' | 'database'>
   onApplied?: () => void
   children?: ReactNode
   wide?: boolean
@@ -246,7 +247,7 @@ function DdlDialog({
   )
 }
 
-function Problem({ children }: { children: ReactNode }) {
+export function Problem({ children }: { children: ReactNode }) {
   if (!children) return null
   return <p className="text-destructive-foreground text-xs">{children}</p>
 }

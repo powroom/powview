@@ -30,7 +30,7 @@ import {
   UploadIcon,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
-import { Fragment, useRef, useState } from 'react'
+import { Fragment, lazy, Suspense, useRef, useState } from 'react'
 import { disconnectConnectionFn } from '@/api/connections.functions'
 import { executeSqlFn } from '@/api/explorer.functions'
 import { Badge } from '@/components/ui/badge'
@@ -111,6 +111,11 @@ import { ConfirmDialog } from './confirm-dialog'
 import { DefinitionDialog } from './definition-dialog'
 import type { DefinitionTarget } from './definition-dialog'
 
+// The dialog is only needed once "New database" is opened, so its code is split out of the sidebar.
+const LazyCreateDatabaseDialog = lazy(() =>
+  import('./create-database-dialog').then((m) => ({ default: m.CreateDatabaseDialog })),
+)
+
 export function WorkspaceSidebar({
   connection,
   database,
@@ -128,6 +133,9 @@ export function WorkspaceSidebar({
   const [definition, setDefinition] = useState<DefinitionTarget | null>(null)
   const [relationAction, setRelationAction] = useState<RelationAction | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
+  const [databaseMenuOpen, setDatabaseMenuOpen] = useState(false)
+  const [createDbMounted, setCreateDbMounted] = useState(false)
+  const [createDbOpen, setCreateDbOpen] = useState(false)
   const filterRef = useRef<HTMLInputElement>(null)
   // The popups are anchored to their own trigger; the combobox default anchor is not set here.
   const databaseTriggerRef = useRef<HTMLButtonElement>(null)
@@ -210,6 +218,18 @@ export function WorkspaceSidebar({
   ]
   const databaseList = databases ?? [{ name: database, size: null }]
   const databaseNames = databaseList.map((d) => d.name)
+  // why "New database" cannot be used now, or null
+  const createDbBlocked = connection.readOnly
+    ? 'This connection is read-only'
+    : server?.canCreateDatabase === false
+      ? 'Your database user cannot create databases'
+      : null
+  const openCreateDatabase = () => {
+    closeSheet()
+    setDatabaseMenuOpen(false)
+    setCreateDbMounted(true)
+    setCreateDbOpen(true)
+  }
 
   const needle = filter.trim().toLowerCase()
 
@@ -336,11 +356,13 @@ export function WorkspaceSidebar({
           <Combobox
             autoHighlight
             items={databaseNames}
+            onOpenChange={setDatabaseMenuOpen}
             onValueChange={(v) => {
               if (v && v !== database) {
                 void navigate({ to: '/c/$connId/$db', params: { connId: connectionId, db: v } })
               }
             }}
+            open={databaseMenuOpen}
             value={database}
           >
             <ComboboxTrigger
@@ -379,6 +401,28 @@ export function WorkspaceSidebar({
                   )
                 }}
               </ComboboxList>
+              <div className="border-t p-1">
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      // a disabled button gets no pointer events: the wrapper shows why
+                      <span className="flex" />
+                    }
+                  >
+                    <Button
+                      className="w-full justify-start"
+                      disabled={Boolean(createDbBlocked)}
+                      onClick={openCreateDatabase}
+                      size="sm"
+                      variant="ghost"
+                    >
+                      <PlusIcon aria-hidden="true" />
+                      New database
+                    </Button>
+                  </TooltipTrigger>
+                  {createDbBlocked && <TooltipPopup>{createDbBlocked}</TooltipPopup>}
+                </Tooltip>
+              </div>
             </ComboboxPopup>
           </Combobox>
         </SidebarHeader>
@@ -724,6 +768,16 @@ export function WorkspaceSidebar({
         tableNames={(objects.data?.relations ?? []).map((r) => r.name)}
         target={{ connectionId, database, schema }}
       />
+      {createDbMounted && (
+        <Suspense fallback={null}>
+          <LazyCreateDatabaseDialog
+            connectionId={connectionId}
+            database={database}
+            onOpenChange={setCreateDbOpen}
+            open={createDbOpen}
+          />
+        </Suspense>
+      )}
     </>
   )
 }
