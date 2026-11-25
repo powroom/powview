@@ -56,7 +56,20 @@ await copyFile(path.join(root, 'dist', 'cli', 'powview.js'), path.join(outDir, '
 await copyFile(path.join(root, 'npm', 'bin', 'powview.mjs'), path.join(outDir, 'bin', 'powview.mjs'))
 await chmod(path.join(outDir, 'bin', 'powview.mjs'), 0o755)
 await copyFile(path.join(root, 'npm', 'lib', 'launcher.mjs'), path.join(outDir, 'lib', 'launcher.mjs'))
-await copyFile(path.join(root, 'README.md'), path.join(outDir, 'README.md'))
+// The npm page has no repository files next to the README, so relative links and images point to
+// GitHub instead, at this version's tag: images to the raw file, links to the file page.
+const repoUrl = 'https://github.com/powroom/powview'
+const rawUrl = 'https://raw.githubusercontent.com/powroom/powview'
+const tag = `v${rootPackage.version}`
+const readme = await readFile(path.join(root, 'README.md'), 'utf8')
+await writeFile(
+  path.join(outDir, 'README.md'),
+  readme.replace(
+    /(!?)\[([^\]]*)\]\((?!https?:|#|mailto:)([^)\s]+)\)/g,
+    (_match, bang: string, text: string, target: string) =>
+      bang ? `![${text}](${rawUrl}/${tag}/${target})` : `[${text}](${repoUrl}/blob/${tag}/${target})`,
+  ),
+)
 
 // Apache-2.0 asks every copy to carry the license and the NOTICE file.
 await copyFile(path.join(root, 'LICENSE'), path.join(outDir, 'LICENSE'))
