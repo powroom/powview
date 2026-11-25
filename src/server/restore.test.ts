@@ -1,12 +1,17 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { Readable } from 'node:stream'
 import { RESTORE_FORMAT_LABELS, detectRestoreFormat, restoreFormatMismatch, restoreUrl } from '@/lib/db-restore'
 import { HttpError } from './http/util.server'
 import type { DumpTarget } from './dump.server'
 import {
   StderrTally,
   buildRestorePlan,
+  buildScriptRestorePlan,
+  dropTransactionTimeout,
+  filterHeaderLine,
   isErrorLine,
   parseRestoreParams,
+  predatesTransactionTimeout,
   restoreLimitMb,
   restoreResponse,
   toolFor,
@@ -31,6 +36,53 @@ function target(overrides: Partial<DumpTarget> = {}): DumpTarget {
 
 const bytes = (...values: number[]) => Uint8Array.from(values)
 const ascii = (text: string) => new TextEncoder().encode(text)
+
+/** A stderr-like reader that yields each string as one chunk. */
+function streamOf(...chunks: string[]): ReadableStreamDefaultReader<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(ascii(chunk))
+      controller.close()
+    },
+  }).getReader()
+}
+
+/** The text that comes out of dropTransactionTimeout for the given byte chunks. */
+async function filterDump(chunks: Uint8Array[]): Promise<string> {
+  const out: Buffer[] = []
+  for await (const piece of Readable.from(chunks).pipe(dropTransactionTimeout())) out.push(piece as Buffer)
+  return Buffer.concat(out).toString('utf8')
+}
+
+/** The first 13 lines of a pg_dump 18 plain dump taken from a PostgreSQL 16 server. */
+const DUMP_HEAD = [
+  '--',
+  '-- PostgreSQL database dump',
+  '--',
+  '',
+  '-- Dumped from database version 16.4',
+  '-- Dumped by pg_dump version 18.0',
+  '',
+  'SET statement_timeout = 0;',
+  'SET lock_timeout = 0;',
+  'SET idle_in_transaction_session_timeout = 0;',
+  "SET client_encoding = 'UTF8';",
+  'SET standard_conforming_strings = on;',
+  'SET transaction_timeout = 0;',
+]
+const DUMP_BODY = [
+  "SELECT pg_catalog.set_config('search_path', '', false);",
+  'SET row_security = off;',
+  '',
+  'CREATE TABLE public.t (id integer);',
+  '',
+  'COPY public.t (id) FROM stdin;',
+  'SET transaction_timeout = 0;',
+  '\\.',
+  '',
+  '-- PostgreSQL database dump complete',
+  '',
+]
 
 const ORIGINAL_LIMIT = process.env.POWVIEW_MAX_RESTORE_MB
 afterEach(() => {
@@ -91,6 +143,52 @@ describe('buildRestorePlan: custom files (pg_restore)', () => {
     expect(args).toContain('--clean')
     expect(args).toContain('--if-exists')
     expect(args[args.length - 1]).toBe(FILE)
+  })
+})
+
+describe('buildScriptRestorePlan: custom files on servers older than 17', () => {
+  test('pg_restore writes the script without connecting; psql reads it from stdin', () => {
+    const { dump, psql } = buildScriptRestorePlan(PG_RESTORE, PSQL, target(), { atomic: true, clean: false }, FILE)
+    expect(dump.args).toEqual([PG_RESTORE, '--file=-', '--no-owner', '--no-privileges', FILE])
+    expect(dump.args.some((a) => a.startsWith('--dbname'))).toBe(false)
+    expect(psql.args[0]).toBe(PSQL)
+    expect(psql.args).toContain('--file=-')
+    expect(psql.args).toContain('--no-password')
+    expect(psql.args).toContain('--no-psqlrc')
+    expect(psql.args).toContain('--quiet')
+    expect(psql.args.some((a) => a.startsWith('--dbname='))).toBe(true)
+  })
+
+  test('atomic: psql runs one transaction and stops on the first error', () => {
+    const { psql } = buildScriptRestorePlan(PG_RESTORE, PSQL, target(), { atomic: true, clean: false }, FILE)
+    expect(psql.args).toContain('--single-transaction')
+    expect(psql.args).toContain('--set=ON_ERROR_STOP=1')
+  })
+
+  test('not all or nothing: no transaction and errors do not stop psql', () => {
+    const { psql } = buildScriptRestorePlan(PG_RESTORE, PSQL, target(), { atomic: false, clean: false }, FILE)
+    expect(psql.args).toContain('--set=ON_ERROR_STOP=0')
+    expect(psql.args).not.toContain('--single-transaction')
+  })
+
+  test('pg_restore never gets the atomic flags; psql owns the transaction', () => {
+    const { dump } = buildScriptRestorePlan(PG_RESTORE, PSQL, target(), { atomic: true, clean: false }, FILE)
+    expect(dump.args).not.toContain('--single-transaction')
+    expect(dump.args).not.toContain('--exit-on-error')
+  })
+
+  test('clean goes to pg_restore only, before the file', () => {
+    const { dump, psql } = buildScriptRestorePlan(PG_RESTORE, PSQL, target(), { atomic: true, clean: true }, FILE)
+    expect(dump.args).toEqual([PG_RESTORE, '--file=-', '--no-owner', '--no-privileges', '--clean', '--if-exists', FILE])
+    expect(psql.args).not.toContain('--clean')
+  })
+
+  test('the password only travels in PGPASSWORD, for both programs', () => {
+    const { dump, psql } = buildScriptRestorePlan(PG_RESTORE, PSQL, target(), { atomic: true, clean: false }, FILE)
+    expect(dump.env.PGPASSWORD).toBe(SECRET)
+    expect(psql.env.PGPASSWORD).toBe(SECRET)
+    expect(dump.args.join('\n')).not.toContain(SECRET)
+    expect(psql.args.join('\n')).not.toContain(SECRET)
   })
 })
 
@@ -202,29 +300,41 @@ describe('error counting', () => {
     expect(isErrorLine('psql:/tmp/x.sql:3: NOTICE: ERROR: not an error line')).toBe(false)
   })
 
-  test('the tally counts across chunk boundaries and an unterminated last line', () => {
+  test('the tally counts across chunk boundaries and an unterminated last line', async () => {
     const tally = new StderrTally()
-    tally.push('NOTICE: fine\nERR')
-    tally.push('OR:  first problem\npsql:/tmp/x.sql:4: ERR')
-    tally.push('OR:  second problem\npg_restore: error: third')
-    tally.finish()
+    await tally.read(
+      streamOf(
+        'NOTICE: fine\nERR',
+        'OR:  first problem\npsql:/tmp/x.sql:4: ERR',
+        'OR:  second problem\npg_restore: error: third',
+      ),
+    )
     expect(tally.errors).toBe(3)
   })
 
-  test('the log holds the last 60 lines', () => {
+  test('two streams read at once do not merge their lines', async () => {
+    const tally = new StderrTally()
+    await Promise.all([
+      tally.read(streamOf('ERR', 'OR:  from a\n')),
+      tally.read(streamOf('NOTICE: b\n', 'pg_restore: error: from b\n')),
+    ])
+    expect(tally.errors).toBe(2)
+    expect(tally.log()).toContain('ERROR:  from a')
+  })
+
+  test('the log holds the last 60 lines', async () => {
     const tally = new StderrTally()
     const lines = Array.from({ length: 100 }, (_, i) => `line ${i + 1}`)
-    tally.push(lines.join('\n') + '\n')
-    tally.finish()
+    await tally.read(streamOf(lines.join('\n') + '\n'))
     const log = tally.log().split('\n')
     expect(log).toHaveLength(60)
     expect(log[0]).toBe('line 41')
     expect(log[59]).toBe('line 100')
   })
 
-  test('an empty stderr gives an empty log', () => {
+  test('an empty stderr gives an empty log', async () => {
     const tally = new StderrTally()
-    tally.finish()
+    await tally.read(streamOf())
     expect(tally.log()).toBe('')
     expect(tally.errors).toBe(0)
   })
@@ -352,5 +462,139 @@ describe('tidyLog', () => {
       'line 26: ERROR:  schema "a" already exists',
     )
     expect(tidyLog(`could not open ${f}`, f)).toBe('could not open the file')
+  })
+
+  test('errors from a script on stdin get the line number too', async () => {
+    const { tidyLog } = await import('./restore.server')
+    expect(tidyLog('psql:<stdin>:13: ERROR:  unrecognized configuration parameter', '/tmp/x/dump.sql')).toBe(
+      'line 13: ERROR:  unrecognized configuration parameter',
+    )
+  })
+})
+
+describe('filterHeaderLine', () => {
+  test('the transaction_timeout line in the header becomes an empty line', () => {
+    expect(filterHeaderLine('SET transaction_timeout = 0;', true)).toEqual({ line: '', inHeader: true })
+  })
+
+  test('CRLF line endings keep their carriage return', () => {
+    expect(filterHeaderLine('SET transaction_timeout = 0;\r', true)).toEqual({ line: '\r', inHeader: true })
+  })
+
+  test('other header lines pass and stay in the header', () => {
+    for (const line of [
+      '',
+      '\r',
+      '-- a comment',
+      'SET lock_timeout = 0;',
+      "SELECT pg_catalog.set_config('search_path', '', false);",
+    ]) {
+      expect(filterHeaderLine(line, true)).toEqual({ line, inHeader: true })
+    }
+  })
+
+  test('the first line that is not header ends the header, and that line passes', () => {
+    expect(filterHeaderLine('CREATE TABLE t ();', true)).toEqual({ line: 'CREATE TABLE t ();', inHeader: false })
+  })
+
+  test('after the header nothing is filtered', () => {
+    expect(filterHeaderLine('SET transaction_timeout = 0;', false)).toEqual({
+      line: 'SET transaction_timeout = 0;',
+      inHeader: false,
+    })
+  })
+
+  test('a line with more after the setting is not the setting, so it is not changed', () => {
+    expect(filterHeaderLine('SET transaction_timeout = 0; SELECT 1;', true).line).toBe(
+      'SET transaction_timeout = 0; SELECT 1;',
+    )
+  })
+})
+
+describe('dropTransactionTimeout', () => {
+  const dump = [...DUMP_HEAD, ...DUMP_BODY].join('\n')
+
+  test('line 13 of a dump header is emptied, and the line count stays the same', async () => {
+    const out = await filterDump([ascii(dump)])
+    const lines = out.split('\n')
+    expect(lines[12]).toBe('')
+    expect(lines).toHaveLength(dump.split('\n').length)
+    expect(lines.slice(0, 12)).toEqual(DUMP_HEAD.slice(0, 12))
+  })
+
+  test('the header of a real pg_dump 18 dump, with its \\restrict line before the SET lines', async () => {
+    const real = [
+      '--',
+      '-- PostgreSQL database dump',
+      '--',
+      '',
+      '\\restrict 9EcM7RLWTyZRr5ImzT3I6ZR5c53SXRBq9iC54QkzCfgbcO2dWSklgFNOhEjIOxl',
+      '',
+      '-- Dumped from database version 16.15',
+      '-- Dumped by pg_dump version 18.7',
+      '',
+      'SET statement_timeout = 0;',
+      'SET lock_timeout = 0;',
+      'SET idle_in_transaction_session_timeout = 0;',
+      'SET transaction_timeout = 0;',
+      "SET client_encoding = 'UTF8';",
+      'CREATE TABLE public.a (id integer);',
+    ].join('\n')
+    const lines = (await filterDump([ascii(real)])).split('\n')
+    expect(lines[12]).toBe('')
+    expect(lines[4]).toStartWith('\\restrict ')
+    expect(lines[13]).toBe("SET client_encoding = 'UTF8';")
+  })
+
+  test('CRLF line endings: the line becomes a bare carriage return and newline', async () => {
+    const crlf = [...DUMP_HEAD, ...DUMP_BODY].join('\r\n')
+    const out = await filterDump([ascii(crlf)])
+    expect(out.split('\r\n')[12]).toBe('')
+    expect(out).toContain('\r\nSELECT pg_catalog.set_config')
+  })
+
+  test('chunk boundaries anywhere, even inside a line or a UTF-8 character', async () => {
+    const text = [...DUMP_HEAD.slice(0, 2), '-- Dumped by café', ...DUMP_HEAD.slice(2), ...DUMP_BODY].join('\n')
+    const oneByteChunks = Array.from(ascii(text), (byte) => Uint8Array.of(byte))
+    expect(await filterDump(oneByteChunks)).toBe(await filterDump([ascii(text)]))
+    const out = await filterDump(oneByteChunks)
+    expect(out.split('\n')[13]).toBe('')
+    expect(out).toContain('-- Dumped by café')
+  })
+
+  test('the same text later in the file, inside COPY data, stays', async () => {
+    const out = await filterDump([ascii([...DUMP_HEAD, ...DUMP_BODY].join('\n'))])
+    expect(out).toContain('COPY public.t (id) FROM stdin;\nSET transaction_timeout = 0;\n')
+  })
+
+  test('a file without the line passes unchanged', async () => {
+    const without = [...DUMP_HEAD.filter((line) => !line.startsWith('SET transaction_timeout')), ...DUMP_BODY].join(
+      '\n',
+    )
+    expect(await filterDump([ascii(without)])).toBe(without)
+  })
+
+  test('a header line that ends the file without a newline is still filtered', async () => {
+    expect(await filterDump([ascii('SET transaction_timeout = 0;')])).toBe('')
+    expect(await filterDump([ascii('SELECT 1;')])).toBe('SELECT 1;')
+  })
+})
+
+describe('predatesTransactionTimeout', () => {
+  test('PostgreSQL 14, 15 and 16 predate it', () => {
+    expect(predatesTransactionTimeout('140020')).toBe(true)
+    expect(predatesTransactionTimeout('150010')).toBe(true)
+    expect(predatesTransactionTimeout('160004')).toBe(true)
+  })
+
+  test('17 and newer do not', () => {
+    expect(predatesTransactionTimeout('170000')).toBe(false)
+    expect(predatesTransactionTimeout('180000')).toBe(false)
+  })
+
+  test('an unreadable version counts as 17 or newer', () => {
+    expect(predatesTransactionTimeout(undefined)).toBe(false)
+    expect(predatesTransactionTimeout('')).toBe(false)
+    expect(predatesTransactionTimeout('new')).toBe(false)
   })
 })
